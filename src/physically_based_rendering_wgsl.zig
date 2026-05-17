@@ -372,6 +372,7 @@ pub const deferred_fs = global ++
 \\  @group(0) @binding(7) var brdf_integration_tex: texture_2d<f32>;
 \\  @group(0) @binding(8) var aniso_sam: sampler;
 \\  @group(0) @binding(9) var g_sdf: texture_2d<f32>;
+\\  @group(0) @binding(10) var g_gi: texture_2d<f32>;
 \\
 \\  @fragment fn main(
 \\      @builtin(position) position: vec4<f32>,
@@ -381,6 +382,7 @@ pub const deferred_fs = global ++
 \\      let normal_metal = textureLoad(g_normal, uv, 0);
 \\      let emissive = textureLoad(g_emissive, uv, 0);
 \\      let depth = textureLoad(g_depth, uv, 0);
+\\      let gi = textureLoad(g_gi, uv, 0).xyz;
 \\
 \\      if (uniforms.draw_mode == 1) { // Albedo / Roughness
 \\          return vec4(pow(albedo_rough.xyz, vec3(1.0 / gamma)), 1.0);
@@ -393,6 +395,8 @@ pub const deferred_fs = global ++
 \\      } else if (uniforms.draw_mode == 5) { // SDF
 \\          let sdf_val = textureLoad(g_sdf, uv, 0).x;
 \\          return vec4(vec3(sdf_val), 1.0); // Visualize SDF as grayscale
+\\      } else if (uniforms.draw_mode == 6) { // Radiance Cascades GI
+\\          return vec4(gi, 1.0);
 \\      }
 \\
 \\      if (depth >= 1.0) {
@@ -437,7 +441,12 @@ pub const deferred_fs = global ++
 \\      let specular = prefiltered_color * (f * env_brdf.x + env_brdf.y);
 \\      let ambient = kd * diffuse + specular; // Note: removed ao for now, can be sampled if G-Buffer stores it
 \\
-\\      var color = ambient + emissive.xyz;
+\\      // Screen-Space Radiance Cascades supplies the indirect diffuse
+\\      // contribution from nearby on-screen surfaces; modulate it by
+\\      // the albedo and the diffuse Fresnel term so metals stay metallic.
+\\      let indirect_gi = gi * base_color * kd;
+\\
+\\      var color = ambient + emissive.xyz + indirect_gi;
 \\      color = color / (color + vec3(1.0));
 \\      return vec4(pow(color, vec3(1.0 / gamma)), 1.0);
 \\  }

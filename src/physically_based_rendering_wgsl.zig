@@ -372,7 +372,7 @@ pub const deferred_fs = global ++
 \\  @group(0) @binding(7) var brdf_integration_tex: texture_2d<f32>;
 \\  @group(0) @binding(8) var aniso_sam: sampler;
 \\  @group(0) @binding(9) var g_sdf: texture_2d<f32>;
-\\  @group(0) @binding(10) var g_gi: texture_2d<f32>;
+\\  @group(1) @binding(0) var g_gi: texture_2d<f32>;
 \\
 \\  @fragment fn main(
 \\      @builtin(position) position: vec4<f32>,

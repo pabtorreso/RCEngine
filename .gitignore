@@ -1,0 +1,19 @@
+# Zig build artifacts
+zig-cache/
+zig-out/
+.zig-cache/
+
+# Developer environment / editor directories
+.vscode/
+.idea/
+*.suo
+*.user
+*.userossc
+*.sln
+*.vcxproj
+*.filters
+
+# OS generated files
+Thumbs.db
+Desktop.ini
+.DS_Store

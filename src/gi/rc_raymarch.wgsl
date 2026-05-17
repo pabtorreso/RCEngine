@@ -30,12 +30,25 @@ struct RCPassParams {
 
 const PI: f32 = 3.14159265359;
 const HIT_EPSILON_PX: f32 = 1.0;
+const MAX_RAYS: f32 = 64.0;
 
 fn skyRadiance(dir: vec2<f32>, intensity: f32) -> vec3<f32> {
     let up = clamp(-dir.y, 0.0, 1.0);
     let zenith = vec3<f32>(0.35, 0.55, 0.95);
     let horizon = vec3<f32>(0.85, 0.75, 0.55);
     return mix(horizon, zenith, up) * intensity;
+}
+
+// Hash a 2D integer coordinate into a `[0, 1)` float. Deterministic per
+// pixel, so it gives spatial-jitter without introducing temporal flicker
+// (which would happen if we mixed in the frame index).
+fn hash2D(p: vec2<u32>) -> f32 {
+    var x: u32 = p.x * 73856093u;
+    x = x ^ (p.y * 19349663u);
+    x = x ^ (x >> 16u);
+    x = x * 2654435761u;
+    x = x ^ (x >> 15u);
+    return f32(x & 0xffffffu) / f32(0x1000000u);
 }
 
 @compute @workgroup_size(8, 8)
@@ -49,9 +62,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cascade_idx = f32(params.cascade_index);
     let scale = pow(2.0, cascade_idx); // 1, 2, 4, ...
     let base_rays = f32(params.base_ray_count);
-    let ray_count = base_rays * pow(2.0, cascade_idx);
+    // Cap the ray count: cascades 4+ would otherwise march 64-128 rays
+    // over very few pixels with diminishing angular benefit.
+    let ray_count = min(base_rays * pow(2.0, cascade_idx), MAX_RAYS);
     let t_0 = pow(4.0, cascade_idx);
     let t_1 = pow(4.0, cascade_idx + 1.0);
+
+    // Per-pixel rotation of the ray bundle. Breaks the angular banding
+    // that appears when neighbouring pixels share the exact same set of
+    // ray directions, at zero extra GPU cost.
+    let jitter = hash2D(gid.xy);
 
     // Probe position in screen-space coordinates.
     let pos = (vec2<f32>(gid.xy) + 0.5) * scale;
@@ -77,7 +97,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let angular_step = (2.0 * PI) / ray_count;
 
     for (var i: i32 = 0; i < i32(ray_count); i = i + 1) {
-        let angle = (f32(i) + 0.5) * angular_step;
+        let angle = (f32(i) + jitter) * angular_step;
         let dir = vec2<f32>(cos(angle), sin(angle));
 
         var t = t_0;

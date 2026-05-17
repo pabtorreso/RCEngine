@@ -60,13 +60,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sw = f32(params.screen_width);
     let sh = f32(params.screen_height);
     let cascade_idx = f32(params.cascade_index);
-    let scale = pow(2.0, cascade_idx); // 1, 2, 4, ...
     let base_rays = f32(params.base_ray_count);
     // Cap the ray count: cascades 4+ would otherwise march 64-128 rays
     // over very few pixels with diminishing angular benefit.
     let ray_count = min(base_rays * pow(2.0, cascade_idx), MAX_RAYS);
     let t_0 = pow(4.0, cascade_idx);
     let t_1 = pow(4.0, cascade_idx + 1.0);
+
+    // Map cascade pixel → screen pixel. Derive the scale from real
+    // dimensions so this also works when the user picks a coarser GI
+    // quality level (cascade 0 becomes half-res, etc.).
+    let scale = vec2<f32>(sw / f32(cw), sh / f32(ch));
 
     // Per-pixel rotation of the ray bundle. Breaks the angular banding
     // that appears when neighbouring pixels share the exact same set of

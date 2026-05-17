@@ -123,6 +123,11 @@ const DemoState = struct {
 
     sdf_generator: SdfGenerator,
     radiance_cascades: RadianceCascades,
+
+    // Currently-applied GI quality level (0=Ultra, 1=High, 2=Performance).
+    gi_quality_level: i32 = 0,
+    // What the GUI slider says — `draw()` reconciles it before dispatch.
+    gi_quality_pending: i32 = 0,
 };
 
 fn loadAllMeshes(
@@ -501,7 +506,7 @@ fn create(allocator: std.mem.Allocator, window: *zglfw.Window) !*DemoState {
     });
 
     const sdf_generator = SdfGenerator.init(gctx, gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height);
-    const radiance_cascades = RadianceCascades.init(gctx, gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height);
+    const radiance_cascades = RadianceCascades.init(gctx, gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height, 0);
 
     const deferred_bg = gctx.createBindGroup(deferred_bgl, &.{
         .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = 80 }, // dummy size, replaced in draw
@@ -712,6 +717,10 @@ fn update(demo: *DemoState) void {
         zgui.spacing();
         zgui.separator();
         zgui.text("Radiance Cascades", .{});
+        _ = zgui.combo("GI quality", .{
+            .current_item = &demo.gi_quality_pending,
+            .items_separated_by_zeros = "Ultra (full-res C0)\x00High (half-res C0)\x00Performance (quarter-res C0)\x00\x00",
+        });
         _ = zgui.sliderInt("Base rays (log2)", .{
             .v = &demo.radiance_cascades.base_ray_count_log,
             .min = 1,
@@ -890,6 +899,25 @@ fn draw(demo: *DemoState) void {
             }
         }
 
+        // Apply a pending GI-quality change, if any. Recreates the RC
+        // textures and the GI bind group so the new resolution is wired
+        // into the deferred fragment shader before dispatch.
+        if (demo.gi_quality_pending != demo.gi_quality_level) {
+            const new_q: u32 = @intCast(@max(0, demo.gi_quality_pending));
+            demo.radiance_cascades.deinit(gctx);
+            demo.radiance_cascades = RadianceCascades.init(
+                gctx,
+                gctx.swapchain_descriptor.width,
+                gctx.swapchain_descriptor.height,
+                new_q,
+            );
+            gctx.releaseResource(demo.deferred_gi_bg);
+            demo.deferred_gi_bg = gctx.createBindGroup(demo.deferred_gi_bgl, &.{
+                .{ .binding = 0, .texture_view_handle = demo.radiance_cascades.output_view },
+            });
+            demo.gi_quality_level = demo.gi_quality_pending;
+        }
+
         // SDF Generation Pass
         demo.sdf_generator.generate(gctx, encoder, demo.depth_texv);
 
@@ -1044,7 +1072,7 @@ fn draw(demo: *DemoState) void {
         demo.sdf_generator.deinit(gctx);
         demo.radiance_cascades.deinit(gctx);
         demo.sdf_generator = SdfGenerator.init(gctx, gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height);
-        demo.radiance_cascades = RadianceCascades.init(gctx, gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height);
+        demo.radiance_cascades = RadianceCascades.init(gctx, gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height, @intCast(demo.gi_quality_level));
 
         // Rebuild the deferred bind groups so they point at the new views.
         gctx.releaseResource(demo.deferred_bg);

@@ -23,6 +23,7 @@ const rc_merge_wgsl = @embedFile("rc_merge.wgsl");
 const rc_finalize_wgsl = @embedFile("rc_finalize.wgsl");
 
 const MAX_CASCADES: u32 = 6;
+pub const MAX_QUALITY_LEVEL: u32 = 2; // 0=Ultra (full-res C0), 1=High (half-res C0), 2=Performance (quarter-res C0)
 
 const RCPassParams = extern struct {
     cascade_index: i32,
@@ -52,8 +53,11 @@ const FinalizeParams = extern struct {
     _padding: [60]u32 = [_]u32{0} ** 60,
 };
 
-fn cascadeDim(full_dim: u32, n: u32) u32 {
-    const shifted = full_dim >> @as(u5, @intCast(n));
+fn cascadeDim(full_dim: u32, n: u32, quality_level: u32) u32 {
+    // Quality level shifts every cascade an extra `quality_level`
+    // power-of-two down. quality=0 → cascade 0 is full-res; quality=1
+    // → cascade 0 is half-res; etc.
+    const shifted = full_dim >> @as(u5, @intCast(n + quality_level));
     return @max(1, shifted);
 }
 
@@ -61,6 +65,7 @@ pub const RadianceCascades = struct {
     width: u32,
     height: u32,
     cascade_count: u32,
+    quality_level: u32,
 
     // Final GI output sampled by deferred_fs (always full-res).
     output_texture: zgpu.TextureHandle,
@@ -98,7 +103,9 @@ pub const RadianceCascades = struct {
         gctx: *zgpu.GraphicsContext,
         width: u32,
         height: u32,
+        quality_level: u32,
     ) RadianceCascades {
+        const q = @min(quality_level, MAX_QUALITY_LEVEL);
         const diagonal = @sqrt(@as(f32, @floatFromInt(width * width + height * height)));
         const base: f32 = 4.0;
         const natural_count: u32 = @intFromFloat(@ceil(std.math.log(f32, base, diagonal)));
@@ -121,8 +128,8 @@ pub const RadianceCascades = struct {
             const n: u32 = @intCast(i);
             // Allocate textures even for unused slots so deinit can free
             // them uniformly; pick 1×1 for the slots past `cascade_count`.
-            const w = if (n < cascade_count) cascadeDim(width, n) else 1;
-            const h = if (n < cascade_count) cascadeDim(height, n) else 1;
+            const w = if (n < cascade_count) cascadeDim(width, n, q) else 1;
+            const h = if (n < cascade_count) cascadeDim(height, n, q) else 1;
 
             cascade_textures[i] = gctx.createTexture(.{
                 .usage = .{ .texture_binding = true, .storage_binding = true },
@@ -191,6 +198,7 @@ pub const RadianceCascades = struct {
             .width = width,
             .height = height,
             .cascade_count = cascade_count,
+            .quality_level = q,
             .output_texture = output_texture,
             .output_view = output_view,
             .cascade_textures = cascade_textures,
@@ -250,8 +258,8 @@ pub const RadianceCascades = struct {
 
         while (current_cascade >= 0) : (current_cascade -= 1) {
             const idx: u32 = @intCast(current_cascade);
-            const cw = cascadeDim(self.width, idx);
-            const ch = cascadeDim(self.height, idx);
+            const cw = cascadeDim(self.width, idx, self.quality_level);
+            const ch = cascadeDim(self.height, idx, self.quality_level);
             const wg_x = (cw + 7) / 8;
             const wg_y = (ch + 7) / 8;
 

@@ -28,8 +28,17 @@ const SLOTS_PER_SCOPE: u32 = 2;
 const TOTAL_SLOTS: u32 = MAX_SCOPES * SLOTS_PER_SCOPE;
 
 const MapState = enum {
+    /// Buffer is free; safe to kick a new resolve+copy.
     idle,
+    /// `resolveQuerySet` + `copyBufferToBuffer` were enqueued; we're
+    /// waiting for the next `pollResults` (post-submit) to fire
+    /// `mapAsync`. Calling `mapAsync` *before* the submit would put the
+    /// buffer in "pending map" state, which makes Dawn reject the
+    /// submit.
+    copy_pending,
+    /// `mapAsync` was kicked; the callback hasn't fired yet.
     in_flight,
+    /// Callback fired with success; data is mappable.
     ready,
 };
 
@@ -115,7 +124,11 @@ pub const GpuProfiler = struct {
         self.open_scope = false;
     }
 
-    /// Resolve + (if no readback in flight) copy + mapAsync.
+    /// Resolve the query set and, if the readback buffer is free,
+    /// enqueue a copy into it. Call this BEFORE submit. `mapAsync` is
+    /// deferred to `pollResults` (post-submit) to avoid putting the
+    /// buffer into "pending map" state while the encoder is still
+    /// being submitted.
     pub fn finishFrame(self: *GpuProfiler, encoder: wgpu.CommandEncoder) void {
         if (!self.enabled or self.scope_count == 0) return;
 
@@ -126,6 +139,19 @@ pub const GpuProfiler = struct {
         if (self.map_state == .idle) {
             encoder.copyBufferToBuffer(self.resolve_buffer, 0, self.readback_buffer, 0, byte_size);
             self.pending_scope_count = self.scope_count;
+            self.map_state = .copy_pending;
+        }
+    }
+
+    /// Call AFTER submit. Drives the state machine: kicks off the
+    /// `mapAsync` when a copy has just been submitted, ticks the device
+    /// so pending callbacks fire, and reads out the timings when ready.
+    pub fn pollResults(self: *GpuProfiler, device: wgpu.Device) void {
+        if (!self.enabled) return;
+
+        // Kick the async map now that the submit has happened.
+        if (self.map_state == .copy_pending) {
+            const byte_size: u64 = @as(u64, self.pending_scope_count * SLOTS_PER_SCOPE) * @sizeOf(u64);
             self.map_state = .in_flight;
             self.readback_buffer.mapAsync(
                 .{ .read = true },
@@ -135,11 +161,6 @@ pub const GpuProfiler = struct {
                 @ptrCast(self),
             );
         }
-    }
-
-    /// Advance the device and, if a mapping completed, read the timings out.
-    pub fn pollResults(self: *GpuProfiler, device: wgpu.Device) void {
-        if (!self.enabled) return;
 
         // Process any pending async callbacks (Dawn requires explicit polling).
         device.tick();

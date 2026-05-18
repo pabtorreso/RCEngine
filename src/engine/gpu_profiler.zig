@@ -62,6 +62,8 @@ pub const GpuProfiler = struct {
             .label = "gpu_profiler_qset",
             .query_type = .timestamp,
             .count = TOTAL_SLOTS,
+            .pipeline_statistics = null,
+            .pipeline_statistics_count = 0,
         });
         const resolve_buffer = device.createBuffer(.{
             .label = "gpu_profiler_resolve",

@@ -43,11 +43,13 @@ const filtered_env_tex_resolution = 512;
 const filtered_env_tex_mip_levels = 6;
 const brdf_integration_tex_resolution = 512;
 
-const MeshUniforms = struct {
+const MeshUniforms = extern struct {
     object_to_world: zm.Mat,
     world_to_clip: zm.Mat,
     camera_position: [3]f32,
     draw_mode: i32,
+    emissive_color: [3]f32,
+    _pad: f32 = 0,
 };
 
 const DemoState = struct {
@@ -251,6 +253,15 @@ fn loadAllMeshes(
         var mesh = zmesh.Shape.initTrefoilKnot(20, 128, 0.8);
         defer mesh.deinit();
         mesh.rotate(math.pi * 0.5, 1.0, 0.0, 0.0);
+        mesh.unweld();
+        try appendProcedural(&mesh, out_meshes, out_vertices, out_indices);
+    }
+    // Emissive sphere — the SSRC "light source" of the scene.
+    {
+        var mesh = zmesh.Shape.initParametricSphere(24, 24);
+        defer mesh.deinit();
+        mesh.rotate(math.pi * 0.5, 1.0, 0.0, 0.0);
+        mesh.scale(0.6, 0.6, 0.6);
         mesh.unweld();
         try appendProcedural(&mesh, out_meshes, out_vertices, out_indices);
     }
@@ -909,13 +920,26 @@ fn draw(demo: *DemoState) void {
 
             for (demo.meshes.items[1..], 0..) |mesh, i| {
                 const is_procedural = (i > 0);
-                
+                const is_emissive_sphere = (i == 3);
+
                 var object_to_world = zm.rotationY(demo.mesh_yaw);
-                
-                if (is_procedural) {
+
+                if (is_emissive_sphere) {
+                    // Park it between the helmet and the trefoil knot so
+                    // SSRC has nearby surfaces to bounce its light onto.
+                    object_to_world = zm.mul(object_to_world, zm.translation(0.0, 1.6, 1.5));
+                } else if (is_procedural) {
                     const offset_x = @as(f32, @floatFromInt(i)) * 3.0;
                     object_to_world = zm.mul(object_to_world, zm.translation(offset_x - 3.0, 0.0, 3.0));
                 }
+
+                // Warm bright emission only for the dedicated sphere; the
+                // other meshes write 0 so the G-Buffer emissive channel
+                // stays clean.
+                const emissive: [3]f32 = if (is_emissive_sphere)
+                    .{ 3.5, 2.2, 0.8 }
+                else
+                    .{ 0.0, 0.0, 0.0 };
 
                 const mem = gctx.uniformsAllocate(MeshUniforms, 1);
                 mem.slice[0] = .{
@@ -923,6 +947,7 @@ fn draw(demo: *DemoState) void {
                     .world_to_clip = zm.transpose(cam_world_to_clip),
                     .camera_position = demo.camera.position,
                     .draw_mode = demo.draw_mode,
+                    .emissive_color = emissive,
                 };
 
                 pass.setBindGroup(0, mesh_bg, &.{mem.offset});

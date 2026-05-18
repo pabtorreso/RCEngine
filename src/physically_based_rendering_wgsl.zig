@@ -268,6 +268,8 @@ const mesh_common =
 \\      world_to_clip: mat4x4<f32>,
 \\      camera_position: vec3<f32>,
 \\      draw_mode: i32,
+\\      emissive_color: vec3<f32>,
+\\      _pad: f32,
 \\  }
 \\  @group(0) @binding(0) var<uniform> uniforms: MeshUniforms;
 \\
@@ -341,7 +343,7 @@ pub const mesh_fs = global ++ mesh_common ++
 \\      var output: GBufferOutput;
 \\      output.albedo_roughness = vec4(base_color, roughness);
 \\      output.normal_metal = vec4(n, metallic);
-\\      output.emissive = vec4(0.0, 0.0, 0.0, 1.0);
+\\      output.emissive = vec4(uniforms.emissive_color, 1.0);
 \\      return output;
 \\  }
 ;

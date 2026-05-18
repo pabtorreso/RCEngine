@@ -11,6 +11,7 @@ const wgsl = @import("physically_based_rendering_wgsl.zig");
 const zstbi = @import("zstbi");
 const SdfGenerator = @import("scene/sdf_generator.zig").SdfGenerator;
 const RadianceCascades = @import("gi/radiance_cascades.zig").RadianceCascades;
+const GpuProfiler = @import("engine/gpu_profiler.zig").GpuProfiler;
 
 const content_dir = @import("build_options").content_dir;
 const window_title = "zig-gamedev: physically based rendering (wgpu)";
@@ -128,6 +129,9 @@ const DemoState = struct {
     gi_quality_level: i32 = 0,
     // What the GUI slider says — `draw()` reconciles it before dispatch.
     gi_quality_pending: i32 = 0,
+
+    // GPU profiler — disabled silently if `timestamp-query` is missing.
+    gpu_profiler: GpuProfiler,
 };
 
 fn loadAllMeshes(
@@ -261,7 +265,9 @@ fn create(allocator: std.mem.Allocator, window: *zglfw.Window) !*DemoState {
             .fn_getWaylandSurface = @ptrCast(&zglfw.getWaylandWindow),
             .fn_getCocoaWindow = @ptrCast(&zglfw.getCocoaWindow),
         },
-        .{},
+        .{
+            .required_features = &[_]wgpu.FeatureName{.timestamp_query},
+        },
     );
     errdefer gctx.destroy(allocator);
 
@@ -507,6 +513,7 @@ fn create(allocator: std.mem.Allocator, window: *zglfw.Window) !*DemoState {
 
     const sdf_generator = SdfGenerator.init(gctx, gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height);
     const radiance_cascades = RadianceCascades.init(gctx, gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height, 0);
+    const gpu_profiler = GpuProfiler.init(gctx.device);
 
     const deferred_bg = gctx.createBindGroup(deferred_bgl, &.{
         .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = 80 }, // dummy size, replaced in draw
@@ -563,6 +570,7 @@ fn create(allocator: std.mem.Allocator, window: *zglfw.Window) !*DemoState {
         .meshes = meshes,
         .sdf_generator = sdf_generator,
         .radiance_cascades = radiance_cascades,
+        .gpu_profiler = gpu_profiler,
     };
 
     //
@@ -671,6 +679,7 @@ fn create(allocator: std.mem.Allocator, window: *zglfw.Window) !*DemoState {
 }
 
 fn destroy(allocator: std.mem.Allocator, demo: *DemoState) void {
+    demo.gpu_profiler.deinit();
     demo.meshes.deinit();
     demo.gctx.destroy(allocator);
     allocator.destroy(demo);
@@ -731,6 +740,22 @@ fn update(demo: *DemoState) void {
             .min = 0.0,
             .max = 4.0,
         });
+
+        zgui.spacing();
+        zgui.separator();
+        if (demo.gpu_profiler.enabled) {
+            zgui.text("GPU Profiler (ms)", .{});
+            var pi: u32 = 0;
+            while (pi < demo.gpu_profiler.last_scope_count) : (pi += 1) {
+                zgui.bulletText(
+                    "{s:<12} {d:.3} ms",
+                    .{ demo.gpu_profiler.scope_names[pi], demo.gpu_profiler.last_times_ms[pi] },
+                );
+            }
+            zgui.bulletText("TOTAL        {d:.3} ms", .{demo.gpu_profiler.last_total_ms});
+        } else {
+            zgui.text("GPU Profiler: timestamp-query not supported", .{});
+        }
         _ = zgui.sliderFloat("GI intensity", .{
             .v = &demo.radiance_cascades.gi_intensity,
             .min = 0.0,
@@ -825,7 +850,10 @@ fn draw(demo: *DemoState) void {
             precomputeImageLighting(demo, encoder);
         }
 
+        demo.gpu_profiler.beginFrame();
+
         // Draw SciFiHelmet and procedural meshes.
+        demo.gpu_profiler.beginScope(encoder, "G-Buffer");
         pass: {
             const vb_info = gctx.lookupResourceInfo(demo.vertex_buf) orelse break :pass;
             const ib_info = gctx.lookupResourceInfo(demo.index_buf) orelse break :pass;
@@ -898,6 +926,7 @@ fn draw(demo: *DemoState) void {
                 );
             }
         }
+        demo.gpu_profiler.endScope(encoder);
 
         // Apply a pending GI-quality change, if any. Recreates the RC
         // textures and the GI bind group so the new resolution is wired
@@ -919,9 +948,12 @@ fn draw(demo: *DemoState) void {
         }
 
         // SDF Generation Pass
+        demo.gpu_profiler.beginScope(encoder, "SDF");
         demo.sdf_generator.generate(gctx, encoder, demo.depth_texv);
+        demo.gpu_profiler.endScope(encoder);
 
         // Screen-Space Radiance Cascades — global illumination pass.
+        demo.gpu_profiler.beginScope(encoder, "RC GI");
         demo.radiance_cascades.execute(
             gctx,
             encoder,
@@ -929,8 +961,10 @@ fn draw(demo: *DemoState) void {
             demo.g_emissive_view,
             demo.g_normal_view,
         );
+        demo.gpu_profiler.endScope(encoder);
 
         // Deferred Lighting Pass
+        demo.gpu_profiler.beginScope(encoder, "Deferred");
         pass: {
             const deferred_pipe = gctx.lookupResource(demo.deferred_pipe) orelse break :pass;
             const deferred_bg = gctx.lookupResource(demo.deferred_bg) orelse break :pass;
@@ -971,8 +1005,10 @@ fn draw(demo: *DemoState) void {
             pass.setBindGroup(1, deferred_gi_bg, &.{});
             pass.draw(3, 1, 0, 0);
         }
+        demo.gpu_profiler.endScope(encoder);
 
         // Draw env. cube texture.
+        demo.gpu_profiler.beginScope(encoder, "Skybox+GUI");
         pass: {
             const vb_info = gctx.lookupResourceInfo(demo.vertex_buf) orelse break :pass;
             const ib_info = gctx.lookupResourceInfo(demo.index_buf) orelse break :pass;
@@ -1039,12 +1075,17 @@ fn draw(demo: *DemoState) void {
             }
             zgui.backend.draw(pass);
         }
+        demo.gpu_profiler.endScope(encoder);
+
+        demo.gpu_profiler.finishFrame(encoder);
 
         break :commands encoder.finish(null);
     };
     defer commands.release();
 
     gctx.submit(&.{commands});
+
+    demo.gpu_profiler.pollResults(gctx.device);
 
     if (gctx.present() == .swap_chain_resized) {
         // Release old G-Buffer textures

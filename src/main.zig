@@ -760,6 +760,12 @@ fn update(demo: *DemoState) void {
             .min = 0.0,
             .max = 4.0,
         });
+        _ = zgui.checkbox("GI denoise (bilateral)", .{ .v = &demo.radiance_cascades.denoise_enabled });
+        _ = zgui.sliderFloat("Denoise sigma (normal)", .{
+            .v = &demo.radiance_cascades.denoise_sigma_normal,
+            .min = 0.1,
+            .max = 2.0,
+        });
 
         zgui.spacing();
         zgui.separator();

@@ -21,6 +21,7 @@ const wgpu = zgpu.wgpu;
 const rc_raymarch_wgsl = @embedFile("rc_raymarch.wgsl");
 const rc_merge_wgsl = @embedFile("rc_merge.wgsl");
 const rc_finalize_wgsl = @embedFile("rc_finalize.wgsl");
+const rc_denoise_wgsl = @embedFile("rc_denoise.wgsl");
 
 const MAX_CASCADES: u32 = 6;
 pub const MAX_QUALITY_LEVEL: u32 = 2; // 0=Ultra (full-res C0), 1=High (half-res C0), 2=Performance (quarter-res C0)
@@ -53,6 +54,14 @@ const FinalizeParams = extern struct {
     _padding: [60]u32 = [_]u32{0} ** 60,
 };
 
+const DenoiseParams = extern struct {
+    enabled: i32,
+    sigma_normal: f32,
+    _pad0: f32 = 0,
+    _pad1: f32 = 0,
+    _padding: [60]u32 = [_]u32{0} ** 60,
+};
+
 fn cascadeDim(full_dim: u32, n: u32, quality_level: u32) u32 {
     // Quality level shifts every cascade an extra `quality_level`
     // power-of-two down. quality=0 → cascade 0 is full-res; quality=1
@@ -68,8 +77,14 @@ pub const RadianceCascades = struct {
     quality_level: u32,
 
     // Final GI output sampled by deferred_fs (always full-res).
+    // Produced by the denoise pass.
     output_texture: zgpu.TextureHandle,
     output_view: zgpu.TextureViewHandle,
+
+    // Intermediate texture: finalize writes here, denoise reads from
+    // here and writes the polished result into `output_*`.
+    pre_denoise_texture: zgpu.TextureHandle,
+    pre_denoise_view: zgpu.TextureViewHandle,
 
     // Per-cascade textures (cascade N at width/2^N × height/2^N).
     cascade_textures: [MAX_CASCADES]zgpu.TextureHandle,
@@ -85,19 +100,24 @@ pub const RadianceCascades = struct {
     base_ray_count_log: i32 = 2,
     sun_intensity: f32 = 1.0,
     gi_intensity: f32 = 1.0,
+    denoise_enabled: bool = true,
+    denoise_sigma_normal: f32 = 0.6,
 
     // Pipelines + bind group layouts.
     raymarch_pipeline: zgpu.ComputePipelineHandle,
     merge_pipeline: zgpu.ComputePipelineHandle,
     finalize_pipeline: zgpu.ComputePipelineHandle,
+    denoise_pipeline: zgpu.ComputePipelineHandle,
     raymarch_bgl: zgpu.BindGroupLayoutHandle,
     merge_bgl: zgpu.BindGroupLayoutHandle,
     finalize_bgl: zgpu.BindGroupLayoutHandle,
+    denoise_bgl: zgpu.BindGroupLayoutHandle,
 
     // Uniform buffers (one slot per cascade).
     rc_params_buffer: zgpu.BufferHandle,
     merge_params_buffer: zgpu.BufferHandle,
     finalize_params_buffer: zgpu.BufferHandle,
+    denoise_params_buffer: zgpu.BufferHandle,
 
     pub fn init(
         gctx: *zgpu.GraphicsContext,
@@ -118,6 +138,14 @@ pub const RadianceCascades = struct {
             .mip_level_count = 1,
         });
         const output_view = gctx.createTextureView(output_texture, .{});
+
+        const pre_denoise_texture = gctx.createTexture(.{
+            .usage = .{ .texture_binding = true, .storage_binding = true },
+            .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
+            .format = .rgba16_float,
+            .mip_level_count = 1,
+        });
+        const pre_denoise_view = gctx.createTextureView(pre_denoise_texture, .{});
 
         var cascade_textures: [MAX_CASCADES]zgpu.TextureHandle = undefined;
         var cascade_views: [MAX_CASCADES]zgpu.TextureViewHandle = undefined;
@@ -177,9 +205,17 @@ pub const RadianceCascades = struct {
             zgpu.bufferEntry(2, .{ .compute = true }, .uniform, false, @sizeOf(FinalizeParams)),
         });
 
+        const denoise_bgl = gctx.createBindGroupLayout(&.{
+            zgpu.textureEntry(0, .{ .compute = true }, .unfilterable_float, .tvdim_2d, false), // gi_input
+            zgpu.textureEntry(1, .{ .compute = true }, .unfilterable_float, .tvdim_2d, false), // g_normal
+            zgpu.storageTextureEntry(2, .{ .compute = true }, .write_only, .rgba16_float, .tvdim_2d),
+            zgpu.bufferEntry(3, .{ .compute = true }, .uniform, false, @sizeOf(DenoiseParams)),
+        });
+
         const raymarch_pipeline = createComputePipeline(gctx, raymarch_bgl, rc_raymarch_wgsl, "rc_raymarch");
         const merge_pipeline = createComputePipeline(gctx, merge_bgl, rc_merge_wgsl, "rc_merge");
         const finalize_pipeline = createComputePipeline(gctx, finalize_bgl, rc_finalize_wgsl, "rc_finalize");
+        const denoise_pipeline = createComputePipeline(gctx, denoise_bgl, rc_denoise_wgsl, "rc_denoise");
 
         const rc_params_buffer = gctx.createBuffer(.{
             .usage = .{ .copy_dst = true, .uniform = true },
@@ -193,6 +229,10 @@ pub const RadianceCascades = struct {
             .usage = .{ .copy_dst = true, .uniform = true },
             .size = @sizeOf(FinalizeParams),
         });
+        const denoise_params_buffer = gctx.createBuffer(.{
+            .usage = .{ .copy_dst = true, .uniform = true },
+            .size = @sizeOf(DenoiseParams),
+        });
 
         return .{
             .width = width,
@@ -201,6 +241,8 @@ pub const RadianceCascades = struct {
             .quality_level = q,
             .output_texture = output_texture,
             .output_view = output_view,
+            .pre_denoise_texture = pre_denoise_texture,
+            .pre_denoise_view = pre_denoise_view,
             .cascade_textures = cascade_textures,
             .cascade_views = cascade_views,
             .raymarch_textures = raymarch_textures,
@@ -210,22 +252,28 @@ pub const RadianceCascades = struct {
             .raymarch_pipeline = raymarch_pipeline,
             .merge_pipeline = merge_pipeline,
             .finalize_pipeline = finalize_pipeline,
+            .denoise_pipeline = denoise_pipeline,
             .raymarch_bgl = raymarch_bgl,
             .merge_bgl = merge_bgl,
             .finalize_bgl = finalize_bgl,
+            .denoise_bgl = denoise_bgl,
             .rc_params_buffer = rc_params_buffer,
             .merge_params_buffer = merge_params_buffer,
             .finalize_params_buffer = finalize_params_buffer,
+            .denoise_params_buffer = denoise_params_buffer,
         };
     }
 
     pub fn deinit(self: *RadianceCascades, gctx: *zgpu.GraphicsContext) void {
+        gctx.releaseResource(self.denoise_params_buffer);
         gctx.releaseResource(self.finalize_params_buffer);
         gctx.releaseResource(self.merge_params_buffer);
         gctx.releaseResource(self.rc_params_buffer);
+        gctx.releaseResource(self.denoise_bgl);
         gctx.releaseResource(self.finalize_bgl);
         gctx.releaseResource(self.merge_bgl);
         gctx.releaseResource(self.raymarch_bgl);
+        gctx.releaseResource(self.denoise_pipeline);
         gctx.releaseResource(self.finalize_pipeline);
         gctx.releaseResource(self.merge_pipeline);
         gctx.releaseResource(self.raymarch_pipeline);
@@ -237,6 +285,8 @@ pub const RadianceCascades = struct {
             gctx.releaseResource(self.cascade_views[i]);
             gctx.destroyResource(self.cascade_textures[i]);
         }
+        gctx.releaseResource(self.pre_denoise_view);
+        gctx.destroyResource(self.pre_denoise_texture);
         gctx.releaseResource(self.output_view);
         gctx.destroyResource(self.output_texture);
         self.* = undefined;
@@ -333,7 +383,7 @@ pub const RadianceCascades = struct {
             has_upper = 1;
         }
 
-        // --- Finalize: cascade 0 is full-res, just scale & copy. ---
+        // --- Finalize: cascade 0 → pre_denoise (full-res). ---
         {
             const wg_x = (self.width + 7) / 8;
             const wg_y = (self.height + 7) / 8;
@@ -349,11 +399,43 @@ pub const RadianceCascades = struct {
             const pass = encoder.beginComputePass(null);
             const bg = gctx.createBindGroup(self.finalize_bgl, &.{
                 .{ .binding = 0, .texture_view_handle = self.cascade_views[0] },
-                .{ .binding = 1, .texture_view_handle = self.output_view },
+                .{ .binding = 1, .texture_view_handle = self.pre_denoise_view },
                 .{ .binding = 2, .buffer_handle = self.finalize_params_buffer, .offset = 0, .size = @sizeOf(FinalizeParams) },
             });
 
             pass.setPipeline(gctx.lookupResource(self.finalize_pipeline).?);
+            pass.setBindGroup(0, gctx.lookupResource(bg).?, &.{});
+            pass.dispatchWorkgroups(wg_x, wg_y, 1);
+            pass.end();
+            pass.release();
+            gctx.releaseResource(bg);
+        }
+
+        // --- Denoise pass: bilateral filter guided by g_normal. ---
+        {
+            const wg_x = (self.width + 7) / 8;
+            const wg_y = (self.height + 7) / 8;
+
+            const d_params = DenoiseParams{
+                .enabled = if (self.denoise_enabled) 1 else 0,
+                .sigma_normal = self.denoise_sigma_normal,
+            };
+            gctx.queue.writeBuffer(
+                gctx.lookupResource(self.denoise_params_buffer).?,
+                0,
+                DenoiseParams,
+                &[_]DenoiseParams{d_params},
+            );
+
+            const pass = encoder.beginComputePass(null);
+            const bg = gctx.createBindGroup(self.denoise_bgl, &.{
+                .{ .binding = 0, .texture_view_handle = self.pre_denoise_view },
+                .{ .binding = 1, .texture_view_handle = g_normal_view },
+                .{ .binding = 2, .texture_view_handle = self.output_view },
+                .{ .binding = 3, .buffer_handle = self.denoise_params_buffer, .offset = 0, .size = @sizeOf(DenoiseParams) },
+            });
+
+            pass.setPipeline(gctx.lookupResource(self.denoise_pipeline).?);
             pass.setBindGroup(0, gctx.lookupResource(bg).?, &.{});
             pass.dispatchWorkgroups(wg_x, wg_y, 1);
             pass.end();

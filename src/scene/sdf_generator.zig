@@ -14,15 +14,18 @@ const StepParams = extern struct {
     _padding: [60]u32 = [_]u32{0} ** 60, // 64 * 4 = 256 bytes total
 };
 
+pub const MAX_SDF_QUALITY_LEVEL: u32 = 2; // 0=Ultra, 1=High (half), 2=Performance (quarter)
+
 pub const SdfGenerator = struct {
-    width: u32,
+    width: u32,  // effective SDF width (after quality shift)
     height: u32,
+    quality_level: u32,
     sdf_texture: zgpu.TextureHandle,
     sdf_view: zgpu.TextureViewHandle,
     jfa_textures: [2]zgpu.TextureHandle,
     jfa_views: [2]zgpu.TextureViewHandle,
     step_pass_count: u32,
-    
+
     // Pipelines
     init_pipeline: zgpu.ComputePipelineHandle,
     step_pipeline: zgpu.ComputePipelineHandle,
@@ -32,11 +35,14 @@ pub const SdfGenerator = struct {
     init_bgl: zgpu.BindGroupLayoutHandle,
     step_bgl: zgpu.BindGroupLayoutHandle,
     distance_bgl: zgpu.BindGroupLayoutHandle,
-    
+
     // Uniforms
     step_params_buffer: zgpu.BufferHandle,
 
-    pub fn init(gctx: *zgpu.GraphicsContext, width: u32, height: u32) SdfGenerator {
+    pub fn init(gctx: *zgpu.GraphicsContext, screen_width: u32, screen_height: u32, quality_level: u32) SdfGenerator {
+        const q = @min(quality_level, MAX_SDF_QUALITY_LEVEL);
+        const width = @max(1, screen_width >> @as(u5, @intCast(q)));
+        const height = @max(1, screen_height >> @as(u5, @intCast(q)));
         var jfa_textures: [2]zgpu.TextureHandle = undefined;
         var jfa_views: [2]zgpu.TextureViewHandle = undefined;
         for (0..2) |i| {
@@ -95,6 +101,7 @@ pub const SdfGenerator = struct {
         return .{
             .width = width,
             .height = height,
+            .quality_level = q,
             .jfa_textures = jfa_textures,
             .jfa_views = jfa_views,
             .sdf_texture = sdf_texture,

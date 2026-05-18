@@ -81,6 +81,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pos = (vec2<f32>(gid.xy) + 0.5) * scale;
     let diagonal = sqrt(sw * sw + sh * sh);
 
+    // The SDF texture may be at a coarser resolution than the screen
+    // (when the user picks SDF quality High / Performance). Convert
+    // any screen-space coord into SDF-space before sampling.
+    let sdf_dims = vec2<f32>(textureDimensions(g_sdf));
+    let sdf_to_screen = sdf_dims / vec2<f32>(sw, sh);
+
     // Cap the per-ray step count so distant cascades don't burn cycles
     // on rays that have already escaped. The longer the interval the
     // fewer SDF samples it can afford anyway.
@@ -88,7 +94,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let max_steps = i32(max_steps_f);
 
     let pos_screen_i = vec2<i32>(clamp(pos, vec2<f32>(0.0), vec2<f32>(sw - 1.0, sh - 1.0)));
-    let center_sdf_px = textureLoad(g_sdf, pos_screen_i, 0).r * diagonal;
+    let center_sdf_coord = vec2<i32>(vec2<f32>(pos_screen_i) * sdf_to_screen);
+    let center_sdf_px = textureLoad(g_sdf, center_sdf_coord, 0).r * diagonal;
 
     // Background pixels (very far from any geometry) contribute almost
     // nothing — skip the entire ray bundle for them.
@@ -116,7 +123,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 break;
             }
 
-            let dist_px = textureLoad(g_sdf, vec2<i32>(p), 0).r * diagonal;
+            let dist_px = textureLoad(g_sdf, vec2<i32>(p * sdf_to_screen), 0).r * diagonal;
             if (dist_px < HIT_EPSILON_PX) {
                 let emissive = textureLoad(g_emissive, vec2<i32>(p), 0).rgb;
                 let n3 = textureLoad(g_normal, vec2<i32>(p), 0).xyz;

@@ -10,21 +10,25 @@
 
 @compute @workgroup_size(8, 8)
 fn init_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(depth_tex);
-    if (gid.x >= dims.x || gid.y >= dims.y) { return; }
+    // The output SDF may be lower resolution than the depth texture
+    // (when the user picks a coarser SDF quality). Drive bounds and
+    // sampling off the output dimensions.
+    let out_dims = textureDimensions(output_tex);
+    if (gid.x >= out_dims.x || gid.y >= out_dims.y) { return; }
 
-    let depth = textureLoad(depth_tex, vec2<i32>(vec2<u32>(gid.x, gid.y)), 0);
+    let depth_dims = textureDimensions(depth_tex);
+    let scale = vec2<f32>(f32(depth_dims.x), f32(depth_dims.y)) /
+                vec2<f32>(f32(out_dims.x), f32(out_dims.y));
+    let depth_coord = vec2<i32>((vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) * scale);
+    let depth = textureLoad(depth_tex, depth_coord, 0);
+
     var seed: vec2<f32>;
-    
-    // Depth < 1.0 indicates solid geometry
     if (depth < 1.0) {
-        // This pixel is occupied — seed with its own position
         seed = vec2<f32>(f32(gid.x), f32(gid.y));
     } else {
-        // Empty pixel — mark as "no seed" with a far-away value
         seed = vec2<f32>(-1.0, -1.0);
     }
-    
+
     textureStore(output_tex, vec2<i32>(vec2<u32>(gid.x, gid.y)), vec4<f32>(seed, 0.0, 0.0));
 }
 

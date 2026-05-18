@@ -10,6 +10,7 @@ const zmesh = @import("zmesh");
 const wgsl = @import("physically_based_rendering_wgsl.zig");
 const zstbi = @import("zstbi");
 const SdfGenerator = @import("scene/sdf_generator.zig").SdfGenerator;
+const RadianceCascades = @import("gi/radiance_cascades.zig").RadianceCascades;
 
 const content_dir = @import("build_options").content_dir;
 const window_title = "zig-gamedev: physically based rendering (wgpu)";
@@ -81,6 +82,9 @@ const DemoState = struct {
     deferred_pipe: zgpu.RenderPipelineHandle = .{},
     deferred_bgl: zgpu.BindGroupLayoutHandle = .{},
     deferred_bg: zgpu.BindGroupHandle = .{},
+    deferred_gi_bgl: zgpu.BindGroupLayoutHandle = .{},
+    deferred_gi_bg: zgpu.BindGroupHandle = .{},
+    aniso_sam: zgpu.SamplerHandle = .{},
 
     mesh_tex: [num_mesh_textures]zgpu.TextureHandle,
     mesh_texv: [num_mesh_textures]zgpu.TextureViewHandle,
@@ -118,6 +122,12 @@ const DemoState = struct {
     } = .{},
 
     sdf_generator: SdfGenerator,
+    radiance_cascades: RadianceCascades,
+
+    // Currently-applied GI quality level (0=Ultra, 1=High, 2=Performance).
+    gi_quality_level: i32 = 0,
+    // What the GUI slider says — `draw()` reconciles it before dispatch.
+    gi_quality_pending: i32 = 0,
 };
 
 fn loadAllMeshes(
@@ -489,7 +499,14 @@ fn create(allocator: std.mem.Allocator, window: *zglfw.Window) !*DemoState {
         zgpu.textureEntry(9, .{ .fragment = true }, .unfilterable_float, .tvdim_2d, false),
     });
 
+    // zgpu caps a single bind group to 10 entries, so the GI texture
+    // lives in its own group (group 1) instead of growing `deferred_bgl`.
+    const deferred_gi_bgl = gctx.createBindGroupLayout(&.{
+        zgpu.textureEntry(0, .{ .fragment = true }, .unfilterable_float, .tvdim_2d, false), // GI from RC
+    });
+
     const sdf_generator = SdfGenerator.init(gctx, gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height);
+    const radiance_cascades = RadianceCascades.init(gctx, gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height, 0);
 
     const deferred_bg = gctx.createBindGroup(deferred_bgl, &.{
         .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = 80 }, // dummy size, replaced in draw
@@ -502,6 +519,10 @@ fn create(allocator: std.mem.Allocator, window: *zglfw.Window) !*DemoState {
         .{ .binding = 7, .texture_view_handle = brdf_integration_texv },
         .{ .binding = 8, .sampler_handle = aniso_sam },
         .{ .binding = 9, .texture_view_handle = sdf_generator.sdf_view },
+    });
+
+    const deferred_gi_bg = gctx.createBindGroup(deferred_gi_bgl, &.{
+        .{ .binding = 0, .texture_view_handle = radiance_cascades.output_view },
     });
 
     const demo = try allocator.create(DemoState);
@@ -536,8 +557,12 @@ fn create(allocator: std.mem.Allocator, window: *zglfw.Window) !*DemoState {
         .env_bg = env_bg,
         .deferred_bgl = deferred_bgl,
         .deferred_bg = deferred_bg,
+        .deferred_gi_bgl = deferred_gi_bgl,
+        .deferred_gi_bg = deferred_gi_bg,
+        .aniso_sam = aniso_sam,
         .meshes = meshes,
         .sdf_generator = sdf_generator,
+        .radiance_cascades = radiance_cascades,
     };
 
     //
@@ -562,7 +587,7 @@ fn create(allocator: std.mem.Allocator, window: *zglfw.Window) !*DemoState {
     createRenderPipe(
         allocator,
         gctx,
-        &.{deferred_bgl},
+        &.{ deferred_bgl, deferred_gi_bgl },
         wgsl.deferred_vs,
         wgsl.deferred_fs,
         &.{ zgpu.GraphicsContext.swapchain_format },
@@ -687,6 +712,30 @@ fn update(demo: *DemoState) void {
         _ = zgui.radioButtonStatePtr("Draw G-Buffer: Emissive", .{ .v = &demo.draw_mode, .v_button = 3 });
         _ = zgui.radioButtonStatePtr("Draw G-Buffer: Depth", .{ .v = &demo.draw_mode, .v_button = 4 });
         _ = zgui.radioButtonStatePtr("Draw G-Buffer: SDF", .{ .v = &demo.draw_mode, .v_button = 5 });
+        _ = zgui.radioButtonStatePtr("Draw GI: Radiance Cascades", .{ .v = &demo.draw_mode, .v_button = 6 });
+
+        zgui.spacing();
+        zgui.separator();
+        zgui.text("Radiance Cascades", .{});
+        _ = zgui.combo("GI quality", .{
+            .current_item = &demo.gi_quality_pending,
+            .items_separated_by_zeros = "Ultra (full-res C0)\x00High (half-res C0)\x00Performance (quarter-res C0)\x00\x00",
+        });
+        _ = zgui.sliderInt("Base rays (log2)", .{
+            .v = &demo.radiance_cascades.base_ray_count_log,
+            .min = 1,
+            .max = 4,
+        });
+        _ = zgui.sliderFloat("Sky intensity", .{
+            .v = &demo.radiance_cascades.sun_intensity,
+            .min = 0.0,
+            .max = 4.0,
+        });
+        _ = zgui.sliderFloat("GI intensity", .{
+            .v = &demo.radiance_cascades.gi_intensity,
+            .min = 0.0,
+            .max = 4.0,
+        });
     }
     zgui.end();
 
@@ -850,13 +899,42 @@ fn draw(demo: *DemoState) void {
             }
         }
 
+        // Apply a pending GI-quality change, if any. Recreates the RC
+        // textures and the GI bind group so the new resolution is wired
+        // into the deferred fragment shader before dispatch.
+        if (demo.gi_quality_pending != demo.gi_quality_level) {
+            const new_q: u32 = @intCast(@max(0, demo.gi_quality_pending));
+            demo.radiance_cascades.deinit(gctx);
+            demo.radiance_cascades = RadianceCascades.init(
+                gctx,
+                gctx.swapchain_descriptor.width,
+                gctx.swapchain_descriptor.height,
+                new_q,
+            );
+            gctx.releaseResource(demo.deferred_gi_bg);
+            demo.deferred_gi_bg = gctx.createBindGroup(demo.deferred_gi_bgl, &.{
+                .{ .binding = 0, .texture_view_handle = demo.radiance_cascades.output_view },
+            });
+            demo.gi_quality_level = demo.gi_quality_pending;
+        }
+
         // SDF Generation Pass
         demo.sdf_generator.generate(gctx, encoder, demo.depth_texv);
+
+        // Screen-Space Radiance Cascades — global illumination pass.
+        demo.radiance_cascades.execute(
+            gctx,
+            encoder,
+            demo.sdf_generator.sdf_view,
+            demo.g_emissive_view,
+            demo.g_normal_view,
+        );
 
         // Deferred Lighting Pass
         pass: {
             const deferred_pipe = gctx.lookupResource(demo.deferred_pipe) orelse break :pass;
             const deferred_bg = gctx.lookupResource(demo.deferred_bg) orelse break :pass;
+            const deferred_gi_bg = gctx.lookupResource(demo.deferred_gi_bg) orelse break :pass;
 
             const color_attachments = [_]wgpu.RenderPassColorAttachment{.{
                 .view = back_buffer_view,
@@ -890,6 +968,7 @@ fn draw(demo: *DemoState) void {
             };
 
             pass.setBindGroup(0, deferred_bg, &.{mem.offset});
+            pass.setBindGroup(1, deferred_gi_bg, &.{});
             pass.draw(3, 1, 0, 0);
         }
 
@@ -988,6 +1067,31 @@ fn draw(demo: *DemoState) void {
         demo.g_normal_view = gbuffers.g_normal_view;
         demo.g_emissive = gbuffers.g_emissive;
         demo.g_emissive_view = gbuffers.g_emissive_view;
+
+        // SDF + Radiance Cascades depend on screen size — rebuild them.
+        demo.sdf_generator.deinit(gctx);
+        demo.radiance_cascades.deinit(gctx);
+        demo.sdf_generator = SdfGenerator.init(gctx, gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height);
+        demo.radiance_cascades = RadianceCascades.init(gctx, gctx.swapchain_descriptor.width, gctx.swapchain_descriptor.height, @intCast(demo.gi_quality_level));
+
+        // Rebuild the deferred bind groups so they point at the new views.
+        gctx.releaseResource(demo.deferred_bg);
+        gctx.releaseResource(demo.deferred_gi_bg);
+        demo.deferred_bg = gctx.createBindGroup(demo.deferred_bgl, &.{
+            .{ .binding = 0, .buffer_handle = gctx.uniforms.buffer, .offset = 0, .size = 80 },
+            .{ .binding = 1, .texture_view_handle = demo.g_albedo_view },
+            .{ .binding = 2, .texture_view_handle = demo.g_normal_view },
+            .{ .binding = 3, .texture_view_handle = demo.g_emissive_view },
+            .{ .binding = 4, .texture_view_handle = demo.depth_texv },
+            .{ .binding = 5, .texture_view_handle = demo.irradiance_cube_texv },
+            .{ .binding = 6, .texture_view_handle = demo.filtered_env_cube_texv },
+            .{ .binding = 7, .texture_view_handle = demo.brdf_integration_texv },
+            .{ .binding = 8, .sampler_handle = demo.aniso_sam },
+            .{ .binding = 9, .texture_view_handle = demo.sdf_generator.sdf_view },
+        });
+        demo.deferred_gi_bg = gctx.createBindGroup(demo.deferred_gi_bgl, &.{
+            .{ .binding = 0, .texture_view_handle = demo.radiance_cascades.output_view },
+        });
     }
 }
 

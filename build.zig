@@ -24,6 +24,9 @@ pub fn build(b: *std.Build) void {
     @import("zgpu").addLibraryPathsTo(exe);
     const zgpu = b.dependency("zgpu", .{
         .target = target,
+        // Required for the `timestamp-query` feature on Dawn/D3D12: the
+        // feature is gated behind Dawn's "allow unsafe APIs" toggle.
+        .dawn_allow_unsafe_apis = true,
     });
     exe.root_module.addImport("zgpu", zgpu.module("root"));
     exe.linkLibrary(zgpu.artifact("zdawn"));

@@ -22,6 +22,7 @@ const rc_raymarch_wgsl = @embedFile("rc_raymarch.wgsl");
 const rc_merge_wgsl = @embedFile("rc_merge.wgsl");
 const rc_finalize_wgsl = @embedFile("rc_finalize.wgsl");
 const rc_denoise_wgsl = @embedFile("rc_denoise.wgsl");
+const rc_temporal_wgsl = @embedFile("rc_temporal.wgsl");
 
 const MAX_CASCADES: u32 = 6;
 pub const MAX_QUALITY_LEVEL: u32 = 2; // 0=Ultra (full-res C0), 1=High (half-res C0), 2=Performance (quarter-res C0)
@@ -62,6 +63,14 @@ const DenoiseParams = extern struct {
     _padding: [60]u32 = [_]u32{0} ** 60,
 };
 
+const TemporalParams = extern struct {
+    enabled: i32,
+    alpha: f32,
+    _pad0: f32 = 0,
+    _pad1: f32 = 0,
+    _padding: [60]u32 = [_]u32{0} ** 60,
+};
+
 fn cascadeDim(full_dim: u32, n: u32, quality_level: u32) u32 {
     // Quality level shifts every cascade an extra `quality_level`
     // power-of-two down. quality=0 → cascade 0 is full-res; quality=1
@@ -81,10 +90,15 @@ pub const RadianceCascades = struct {
     output_texture: zgpu.TextureHandle,
     output_view: zgpu.TextureViewHandle,
 
-    // Intermediate texture: finalize writes here, denoise reads from
-    // here and writes the polished result into `output_*`.
+    // Pipeline of intermediate full-res textures:
+    //   finalize -> pre_denoise -> denoise -> post_denoise -> temporal -> output
+    // `history` is a copy of last frame's `output`, used by the temporal pass.
     pre_denoise_texture: zgpu.TextureHandle,
     pre_denoise_view: zgpu.TextureViewHandle,
+    post_denoise_texture: zgpu.TextureHandle,
+    post_denoise_view: zgpu.TextureViewHandle,
+    history_texture: zgpu.TextureHandle,
+    history_view: zgpu.TextureViewHandle,
 
     // Per-cascade textures (cascade N at width/2^N × height/2^N).
     cascade_textures: [MAX_CASCADES]zgpu.TextureHandle,
@@ -102,22 +116,27 @@ pub const RadianceCascades = struct {
     gi_intensity: f32 = 1.0,
     denoise_enabled: bool = true,
     denoise_sigma_normal: f32 = 0.6,
+    temporal_enabled: bool = true,
+    temporal_alpha: f32 = 0.15,
 
     // Pipelines + bind group layouts.
     raymarch_pipeline: zgpu.ComputePipelineHandle,
     merge_pipeline: zgpu.ComputePipelineHandle,
     finalize_pipeline: zgpu.ComputePipelineHandle,
     denoise_pipeline: zgpu.ComputePipelineHandle,
+    temporal_pipeline: zgpu.ComputePipelineHandle,
     raymarch_bgl: zgpu.BindGroupLayoutHandle,
     merge_bgl: zgpu.BindGroupLayoutHandle,
     finalize_bgl: zgpu.BindGroupLayoutHandle,
     denoise_bgl: zgpu.BindGroupLayoutHandle,
+    temporal_bgl: zgpu.BindGroupLayoutHandle,
 
     // Uniform buffers (one slot per cascade).
     rc_params_buffer: zgpu.BufferHandle,
     merge_params_buffer: zgpu.BufferHandle,
     finalize_params_buffer: zgpu.BufferHandle,
     denoise_params_buffer: zgpu.BufferHandle,
+    temporal_params_buffer: zgpu.BufferHandle,
 
     pub fn init(
         gctx: *zgpu.GraphicsContext,
@@ -131,8 +150,10 @@ pub const RadianceCascades = struct {
         const natural_count: u32 = @intFromFloat(@ceil(std.math.log(f32, base, diagonal)));
         const cascade_count = @min(@max(natural_count, 1), MAX_CASCADES);
 
+        // Output (consumed by deferred_fs) needs copy_src so we can
+        // snapshot it into `history_texture` at end of frame.
         const output_texture = gctx.createTexture(.{
-            .usage = .{ .texture_binding = true, .storage_binding = true },
+            .usage = .{ .texture_binding = true, .storage_binding = true, .copy_src = true },
             .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
             .format = .rgba16_float,
             .mip_level_count = 1,
@@ -146,6 +167,22 @@ pub const RadianceCascades = struct {
             .mip_level_count = 1,
         });
         const pre_denoise_view = gctx.createTextureView(pre_denoise_texture, .{});
+
+        const post_denoise_texture = gctx.createTexture(.{
+            .usage = .{ .texture_binding = true, .storage_binding = true },
+            .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
+            .format = .rgba16_float,
+            .mip_level_count = 1,
+        });
+        const post_denoise_view = gctx.createTextureView(post_denoise_texture, .{});
+
+        const history_texture = gctx.createTexture(.{
+            .usage = .{ .texture_binding = true, .copy_dst = true },
+            .size = .{ .width = width, .height = height, .depth_or_array_layers = 1 },
+            .format = .rgba16_float,
+            .mip_level_count = 1,
+        });
+        const history_view = gctx.createTextureView(history_texture, .{});
 
         var cascade_textures: [MAX_CASCADES]zgpu.TextureHandle = undefined;
         var cascade_views: [MAX_CASCADES]zgpu.TextureViewHandle = undefined;
@@ -212,10 +249,18 @@ pub const RadianceCascades = struct {
             zgpu.bufferEntry(3, .{ .compute = true }, .uniform, false, @sizeOf(DenoiseParams)),
         });
 
+        const temporal_bgl = gctx.createBindGroupLayout(&.{
+            zgpu.textureEntry(0, .{ .compute = true }, .unfilterable_float, .tvdim_2d, false), // gi_current
+            zgpu.textureEntry(1, .{ .compute = true }, .unfilterable_float, .tvdim_2d, false), // gi_history
+            zgpu.storageTextureEntry(2, .{ .compute = true }, .write_only, .rgba16_float, .tvdim_2d),
+            zgpu.bufferEntry(3, .{ .compute = true }, .uniform, false, @sizeOf(TemporalParams)),
+        });
+
         const raymarch_pipeline = createComputePipeline(gctx, raymarch_bgl, rc_raymarch_wgsl, "rc_raymarch");
         const merge_pipeline = createComputePipeline(gctx, merge_bgl, rc_merge_wgsl, "rc_merge");
         const finalize_pipeline = createComputePipeline(gctx, finalize_bgl, rc_finalize_wgsl, "rc_finalize");
         const denoise_pipeline = createComputePipeline(gctx, denoise_bgl, rc_denoise_wgsl, "rc_denoise");
+        const temporal_pipeline = createComputePipeline(gctx, temporal_bgl, rc_temporal_wgsl, "rc_temporal");
 
         const rc_params_buffer = gctx.createBuffer(.{
             .usage = .{ .copy_dst = true, .uniform = true },
@@ -233,6 +278,10 @@ pub const RadianceCascades = struct {
             .usage = .{ .copy_dst = true, .uniform = true },
             .size = @sizeOf(DenoiseParams),
         });
+        const temporal_params_buffer = gctx.createBuffer(.{
+            .usage = .{ .copy_dst = true, .uniform = true },
+            .size = @sizeOf(TemporalParams),
+        });
 
         return .{
             .width = width,
@@ -243,6 +292,10 @@ pub const RadianceCascades = struct {
             .output_view = output_view,
             .pre_denoise_texture = pre_denoise_texture,
             .pre_denoise_view = pre_denoise_view,
+            .post_denoise_texture = post_denoise_texture,
+            .post_denoise_view = post_denoise_view,
+            .history_texture = history_texture,
+            .history_view = history_view,
             .cascade_textures = cascade_textures,
             .cascade_views = cascade_views,
             .raymarch_textures = raymarch_textures,
@@ -253,26 +306,32 @@ pub const RadianceCascades = struct {
             .merge_pipeline = merge_pipeline,
             .finalize_pipeline = finalize_pipeline,
             .denoise_pipeline = denoise_pipeline,
+            .temporal_pipeline = temporal_pipeline,
             .raymarch_bgl = raymarch_bgl,
             .merge_bgl = merge_bgl,
             .finalize_bgl = finalize_bgl,
             .denoise_bgl = denoise_bgl,
+            .temporal_bgl = temporal_bgl,
             .rc_params_buffer = rc_params_buffer,
             .merge_params_buffer = merge_params_buffer,
             .finalize_params_buffer = finalize_params_buffer,
             .denoise_params_buffer = denoise_params_buffer,
+            .temporal_params_buffer = temporal_params_buffer,
         };
     }
 
     pub fn deinit(self: *RadianceCascades, gctx: *zgpu.GraphicsContext) void {
+        gctx.releaseResource(self.temporal_params_buffer);
         gctx.releaseResource(self.denoise_params_buffer);
         gctx.releaseResource(self.finalize_params_buffer);
         gctx.releaseResource(self.merge_params_buffer);
         gctx.releaseResource(self.rc_params_buffer);
+        gctx.releaseResource(self.temporal_bgl);
         gctx.releaseResource(self.denoise_bgl);
         gctx.releaseResource(self.finalize_bgl);
         gctx.releaseResource(self.merge_bgl);
         gctx.releaseResource(self.raymarch_bgl);
+        gctx.releaseResource(self.temporal_pipeline);
         gctx.releaseResource(self.denoise_pipeline);
         gctx.releaseResource(self.finalize_pipeline);
         gctx.releaseResource(self.merge_pipeline);
@@ -285,6 +344,10 @@ pub const RadianceCascades = struct {
             gctx.releaseResource(self.cascade_views[i]);
             gctx.destroyResource(self.cascade_textures[i]);
         }
+        gctx.releaseResource(self.history_view);
+        gctx.destroyResource(self.history_texture);
+        gctx.releaseResource(self.post_denoise_view);
+        gctx.destroyResource(self.post_denoise_texture);
         gctx.releaseResource(self.pre_denoise_view);
         gctx.destroyResource(self.pre_denoise_texture);
         gctx.releaseResource(self.output_view);
@@ -431,7 +494,7 @@ pub const RadianceCascades = struct {
             const bg = gctx.createBindGroup(self.denoise_bgl, &.{
                 .{ .binding = 0, .texture_view_handle = self.pre_denoise_view },
                 .{ .binding = 1, .texture_view_handle = g_normal_view },
-                .{ .binding = 2, .texture_view_handle = self.output_view },
+                .{ .binding = 2, .texture_view_handle = self.post_denoise_view },
                 .{ .binding = 3, .buffer_handle = self.denoise_params_buffer, .offset = 0, .size = @sizeOf(DenoiseParams) },
             });
 
@@ -441,6 +504,53 @@ pub const RadianceCascades = struct {
             pass.end();
             pass.release();
             gctx.releaseResource(bg);
+        }
+
+        // --- Temporal accumulation: blend denoised current with the
+        // previous frame's output. Reduces residual noise. Writes the
+        // final result into `output_view` which is what `deferred_fs`
+        // samples.
+        {
+            const wg_x = (self.width + 7) / 8;
+            const wg_y = (self.height + 7) / 8;
+
+            const t_params = TemporalParams{
+                .enabled = if (self.temporal_enabled) 1 else 0,
+                .alpha = self.temporal_alpha,
+            };
+            gctx.queue.writeBuffer(
+                gctx.lookupResource(self.temporal_params_buffer).?,
+                0,
+                TemporalParams,
+                &[_]TemporalParams{t_params},
+            );
+
+            const pass = encoder.beginComputePass(null);
+            const bg = gctx.createBindGroup(self.temporal_bgl, &.{
+                .{ .binding = 0, .texture_view_handle = self.post_denoise_view },
+                .{ .binding = 1, .texture_view_handle = self.history_view },
+                .{ .binding = 2, .texture_view_handle = self.output_view },
+                .{ .binding = 3, .buffer_handle = self.temporal_params_buffer, .offset = 0, .size = @sizeOf(TemporalParams) },
+            });
+
+            pass.setPipeline(gctx.lookupResource(self.temporal_pipeline).?);
+            pass.setBindGroup(0, gctx.lookupResource(bg).?, &.{});
+            pass.dispatchWorkgroups(wg_x, wg_y, 1);
+            pass.end();
+            pass.release();
+            gctx.releaseResource(bg);
+        }
+
+        // Snapshot the just-written output into the history texture so
+        // the next frame's temporal pass can read it.
+        {
+            const src = gctx.lookupResource(self.output_texture).?;
+            const dst = gctx.lookupResource(self.history_texture).?;
+            encoder.copyTextureToTexture(
+                .{ .texture = src },
+                .{ .texture = dst },
+                .{ .width = self.width, .height = self.height, .depth_or_array_layers = 1 },
+            );
         }
     }
 };

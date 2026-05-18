@@ -766,6 +766,12 @@ fn update(demo: *DemoState) void {
             .min = 0.1,
             .max = 2.0,
         });
+        _ = zgui.checkbox("GI temporal accumulation", .{ .v = &demo.radiance_cascades.temporal_enabled });
+        _ = zgui.sliderFloat("Temporal alpha (current weight)", .{
+            .v = &demo.radiance_cascades.temporal_alpha,
+            .min = 0.02,
+            .max = 1.0,
+        });
 
         zgui.spacing();
         zgui.separator();

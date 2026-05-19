@@ -46,45 +46,93 @@ fn init_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // =====================================================================
 // column_main — per column, find nearest seed Y for each pixel.
 //
-// Two sequential sweeps (top-down, bottom-up) per column; we keep the
-// closer candidate. Forward sweep stashes its result into the shared
-// scratch storage buffer at offset (x * H + y), then the backward
-// sweep reads it back and combines.
+// PBA+-style banded scan. Each column is split into BAND_COUNT vertical
+// bands; one thread handles one band, and BAND_COUNT threads cooperate
+// per column via workgroup shared memory. The dispatch launches one
+// workgroup per column (workgroup_size = (1, BAND_COUNT, 1)), so the
+// effective parallelism is W * BAND_COUNT — for 1080p that's
+// 1920 * 32 ≈ 61k threads vs. 1920 in the non-banded version.
+//
+// Algorithm per band:
+//   A. Intra-band: forward sweep within the band. Record the band's
+//      first and last seed Y in shared memory.
+//   B. workgroupBarrier.
+//   C. Each thread independently determines:
+//        above_seed = bottom-seed of the closest band above with any seed.
+//        below_seed = top-seed of the closest band below with any seed.
+//   D. Backward sweep within the band, combining the within-band forward
+//      stash (or the propagated above_seed if the band had no seed yet
+//      at this y) with the within-band/propagated below candidate.
 // =====================================================================
 @group(0) @binding(0) var col_in: texture_2d<u32>;
 @group(0) @binding(1) var col_out: texture_storage_2d<r32uint, write>;
 @group(0) @binding(2) var<storage, read_write> scratch: array<i32>;
 
-@compute @workgroup_size(64, 1, 1)
-fn column_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+const BAND_COUNT: i32 = 32;
+
+var<workgroup> band_top_seed: array<i32, 32>;  // smallest seed-y in each band (or SENTINEL_I)
+var<workgroup> band_bot_seed: array<i32, 32>;  // largest seed-y in each band  (or SENTINEL_I)
+
+@compute @workgroup_size(1, 32, 1)
+fn column_main(
+    @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
     let dims = textureDimensions(col_in);
-    let x = i32(gid.x);
+    let x = i32(wgid.x);
     if (x >= i32(dims.x)) { return; }
     let H = i32(dims.y);
     let base = x * H;
 
+    let band_idx = i32(lid.y);
+    let band_h = (H + BAND_COUNT - 1) / BAND_COUNT;
+    let y_start = band_idx * band_h;
+    let y_end = min(y_start + band_h, H);
+
+    // --- A. Intra-band forward sweep. ---
+    var first: i32 = SENTINEL_I;
     var last: i32 = SENTINEL_I;
-    for (var y: i32 = 0; y < H; y = y + 1) {
+    for (var y: i32 = y_start; y < y_end; y = y + 1) {
         let v = textureLoad(col_in, vec2<i32>(x, y), 0).r;
-        if (v != SENTINEL_U) { last = y; }
-        scratch[base + y] = last;
+        if (v != SENTINEL_U) {
+            if (first == SENTINEL_I) { first = y; }
+            last = y;
+        }
+        scratch[base + y] = last;  // SENTINEL_I until first seed within band is hit
+    }
+    band_top_seed[band_idx] = first;
+    band_bot_seed[band_idx] = last;
+
+    workgroupBarrier();
+
+    // --- C. Propagate cross-band seed candidates. ---
+    var above_seed: i32 = SENTINEL_I;
+    for (var b: i32 = 0; b < band_idx; b = b + 1) {
+        if (band_bot_seed[b] != SENTINEL_I) { above_seed = band_bot_seed[b]; }
+    }
+    var below_seed: i32 = SENTINEL_I;
+    for (var b: i32 = band_idx + 1; b < BAND_COUNT; b = b + 1) {
+        if (band_top_seed[b] != SENTINEL_I) { below_seed = band_top_seed[b]; break; }
     }
 
-    last = SENTINEL_I;
-    for (var y: i32 = H - 1; y >= 0; y = y - 1) {
+    // --- D. Backward sweep within band + combine. ---
+    var last_below: i32 = below_seed;
+    for (var y: i32 = y_end - 1; y >= y_start; y = y - 1) {
         let v = textureLoad(col_in, vec2<i32>(x, y), 0).r;
-        if (v != SENTINEL_U) { last = y; }
+        if (v != SENTINEL_U) { last_below = y; }
 
-        let f = scratch[base + y];
+        var f: i32 = scratch[base + y];
+        if (f == SENTINEL_I) { f = above_seed; }
+
         var nearest: u32 = SENTINEL_U;
-        if (f != SENTINEL_I && last != SENTINEL_I) {
+        if (f != SENTINEL_I && last_below != SENTINEL_I) {
             let d_f = abs(y - f);
-            let d_b = abs(last - y);
-            if (d_f <= d_b) { nearest = u32(f); } else { nearest = u32(last); }
+            let d_b = abs(last_below - y);
+            if (d_f <= d_b) { nearest = u32(f); } else { nearest = u32(last_below); }
         } else if (f != SENTINEL_I) {
             nearest = u32(f);
-        } else if (last != SENTINEL_I) {
-            nearest = u32(last);
+        } else if (last_below != SENTINEL_I) {
+            nearest = u32(last_below);
         }
         textureStore(col_out, vec2<i32>(x, y), vec4<u32>(nearest, 0u, 0u, 0u));
     }

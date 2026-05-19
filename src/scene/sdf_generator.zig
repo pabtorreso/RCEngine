@@ -157,9 +157,9 @@ pub const SdfGenerator = struct {
             gctx.releaseResource(bg);
         }
 
-        // Phase 1: column scan — one thread per column.
+        // Phase 1: banded column scan — one workgroup per column,
+        // 32 threads per workgroup cooperating across vertical bands.
         {
-            const wg_x = (self.width + 63) / 64;
             const pass = encoder.beginComputePass(null);
             const bg = gctx.createBindGroup(self.column_bgl, &.{
                 .{ .binding = 0, .texture_view_handle = self.seed_view },
@@ -169,7 +169,7 @@ pub const SdfGenerator = struct {
 
             pass.setPipeline(gctx.lookupResource(self.column_pipeline).?);
             pass.setBindGroup(0, gctx.lookupResource(bg).?, &.{});
-            pass.dispatchWorkgroups(wg_x, 1, 1);
+            pass.dispatchWorkgroups(self.width, 1, 1);
             pass.end();
             pass.release();
             gctx.releaseResource(bg);

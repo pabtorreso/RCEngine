@@ -132,7 +132,7 @@ const DemoState = struct {
     // What the GUI slider says — `draw()` reconciles it before dispatch.
     gi_quality_pending: i32 = 0,
 
-    // Same scheme for the SDF: drives the JFA resolution (and therefore
+    // Same scheme for the SDF: drives the PBA resolution (and therefore
     // the dominant cost in the frame).
     sdf_quality_level: i32 = 0,
     sdf_quality_pending: i32 = 0,

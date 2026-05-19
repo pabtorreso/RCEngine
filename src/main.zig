@@ -257,11 +257,13 @@ fn loadAllMeshes(
         try appendProcedural(&mesh, out_meshes, out_vertices, out_indices);
     }
     // Emissive sphere — the SSRC "light source" of the scene.
+    // Big enough that the screen-space ray budget actually hits it
+    // on most pixels around it.
     {
         var mesh = zmesh.Shape.initParametricSphere(24, 24);
         defer mesh.deinit();
         mesh.rotate(math.pi * 0.5, 1.0, 0.0, 0.0);
-        mesh.scale(0.6, 0.6, 0.6);
+        mesh.scale(1.1, 1.1, 1.1);
         mesh.unweld();
         try appendProcedural(&mesh, out_meshes, out_vertices, out_indices);
     }
@@ -937,19 +939,19 @@ fn draw(demo: *DemoState) void {
                 var object_to_world = zm.rotationY(demo.mesh_yaw);
 
                 if (is_emissive_sphere) {
-                    // Park it between the helmet and the trefoil knot so
-                    // SSRC has nearby surfaces to bounce its light onto.
-                    object_to_world = zm.mul(object_to_world, zm.translation(0.0, 1.6, 1.5));
+                    // Closer to the helmet so the rim lighting actually shows.
+                    object_to_world = zm.mul(object_to_world, zm.translation(0.4, 1.2, 1.2));
                 } else if (is_procedural) {
                     const offset_x = @as(f32, @floatFromInt(i)) * 3.0;
                     object_to_world = zm.mul(object_to_world, zm.translation(offset_x - 3.0, 0.0, 3.0));
                 }
 
-                // Warm bright emission only for the dedicated sphere; the
-                // other meshes write 0 so the G-Buffer emissive channel
-                // stays clean.
+                // Aggressive HDR emission so the SSRC raymarch — which
+                // divides the accumulated radiance by the ray count and
+                // weights it by facing — still produces a visible warm
+                // bounce on neighbouring meshes.
                 const emissive: [3]f32 = if (is_emissive_sphere)
-                    .{ 3.5, 2.2, 0.8 }
+                    .{ 25.0, 15.0, 5.0 }
                 else
                     .{ 0.0, 0.0, 0.0 };
 

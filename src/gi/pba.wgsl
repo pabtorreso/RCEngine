@@ -155,38 +155,69 @@ fn row_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var num: i32 = 0;
     let diag = sqrt(f32(dims.x * dims.x + dims.y * dims.y));
 
-    // Build envelope.
+    // Build envelope. Top-of-stack and second-from-top are cached in
+    // registers (top_*, sec_*) so the pop comparison reads ZERO from
+    // the row_in texture; only when a pop demotes the second do we
+    // refetch the next site below. This eliminates ~2 reads per pop
+    // (≈2M reads/frame at 1080p).
+    var top_p: i32 = 0;
+    var top_dy: f32 = 0.0;
+    var top_f: f32 = 0.0;
+    var top_p_sq: f32 = 0.0;
+
+    var sec_p: i32 = 0;
+    var sec_dy: f32 = 0.0;
+    var sec_f: f32 = 0.0;
+    var sec_p_sq: f32 = 0.0;
+
     for (var q: i32 = 0; q < W; q = q + 1) {
         let cy_q = textureLoad(row_in, vec2<i32>(q, y), 0).r;
         if (cy_q == SENTINEL_U) { continue; }
         let dy_q = f32(y - i32(cy_q));
         let f_q = dy_q * dy_q;
+        let q_sq = f32(q) * f32(q);
 
         loop {
             if (num == 0) { break; }
-            let p = v[num - 1];
-            let cy_p = textureLoad(row_in, vec2<i32>(p, y), 0).r;
-            let dy_p = f32(y - i32(cy_p));
-            let f_p = dy_p * dy_p;
-
-            let s_pq = ((f_q + f32(q) * f32(q)) - (f_p + f32(p) * f32(p))) /
-                       (2.0 * f32(q - p));
-
+            // Pop comparison: uses cached top_* and sec_*, no texture reads.
+            let s_pq = ((f_q + q_sq) - (top_f + top_p_sq)) /
+                       (2.0 * f32(q - top_p));
             var prev_z: f32 = -1e20;
             if (num >= 2) {
-                let pp = v[num - 2];
-                let cy_pp = textureLoad(row_in, vec2<i32>(pp, y), 0).r;
-                let dy_pp = f32(y - i32(cy_pp));
-                let f_pp = dy_pp * dy_pp;
-                prev_z = ((f_p + f32(p) * f32(p)) - (f_pp + f32(pp) * f32(pp))) /
-                         (2.0 * f32(p - pp));
+                prev_z = ((top_f + top_p_sq) - (sec_f + sec_p_sq)) /
+                         (2.0 * f32(top_p - sec_p));
             }
-
             if (s_pq > prev_z) { break; }
+
+            // Pop: cached second becomes top, refetch new second (if any).
             num = num - 1;
+            if (num >= 1) {
+                top_p = sec_p;
+                top_dy = sec_dy;
+                top_f = sec_f;
+                top_p_sq = sec_p_sq;
+                if (num >= 2) {
+                    sec_p = v[num - 2];
+                    let scy = textureLoad(row_in, vec2<i32>(sec_p, y), 0).r;
+                    sec_dy = f32(y - i32(scy));
+                    sec_f = sec_dy * sec_dy;
+                    sec_p_sq = f32(sec_p) * f32(sec_p);
+                }
+            }
         }
         if (num < MAX_DIM_I) {
+            // Push q. Old top demotes to second.
+            if (num >= 1) {
+                sec_p = top_p;
+                sec_dy = top_dy;
+                sec_f = top_f;
+                sec_p_sq = top_p_sq;
+            }
             v[num] = q;
+            top_p = q;
+            top_dy = dy_q;
+            top_f = f_q;
+            top_p_sq = q_sq;
             num = num + 1;
         }
     }

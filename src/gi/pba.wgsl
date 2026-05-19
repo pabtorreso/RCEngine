@@ -198,29 +198,49 @@ fn row_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Read off.
+    // Read off — cache the current envelope site (and the next one we'd
+    // advance into) in registers so the per-pixel inner loop touches the
+    // row_in texture ONLY when k advances. Previously each x re-loaded
+    // cy_p, which added ~W redundant texture reads per row (~2M at 1080p).
     var k: i32 = 0;
+    var cur_p: i32 = v[0];
+    let cur_cy_load = textureLoad(row_in, vec2<i32>(cur_p, y), 0).r;
+    var cur_dy: f32 = f32(y - i32(cur_cy_load));
+    var cur_f: f32 = cur_dy * cur_dy;
+
+    var has_next: bool = (num > 1);
+    var next_p: i32 = 0;
+    var next_dy: f32 = 0.0;
+    var next_f: f32 = 0.0;
+    if (has_next) {
+        next_p = v[1];
+        let next_cy_load = textureLoad(row_in, vec2<i32>(next_p, y), 0).r;
+        next_dy = f32(y - i32(next_cy_load));
+        next_f = next_dy * next_dy;
+    }
+
     for (var x: i32 = 0; x < W; x = x + 1) {
+        // Advance k while x is past the breakpoint between cur and next.
         loop {
-            if (k + 1 >= num) { break; }
-            let p = v[k];
-            let q = v[k + 1];
-            let cy_p = textureLoad(row_in, vec2<i32>(p, y), 0).r;
-            let cy_q = textureLoad(row_in, vec2<i32>(q, y), 0).r;
-            let dy_p = f32(y - i32(cy_p));
-            let dy_q = f32(y - i32(cy_q));
-            let f_p = dy_p * dy_p;
-            let f_q = dy_q * dy_q;
-            let z = ((f_q + f32(q) * f32(q)) - (f_p + f32(p) * f32(p))) /
-                    (2.0 * f32(q - p));
+            if (!has_next) { break; }
+            let z = ((next_f + f32(next_p) * f32(next_p)) - (cur_f + f32(cur_p) * f32(cur_p))) /
+                    (2.0 * f32(next_p - cur_p));
             if (f32(x) < z) { break; }
+            // Advance: next slides into cur, fetch new next.
+            cur_p = next_p;
+            cur_dy = next_dy;
+            cur_f = next_f;
             k = k + 1;
+            has_next = (k + 1 < num);
+            if (has_next) {
+                next_p = v[k + 1];
+                let nc = textureLoad(row_in, vec2<i32>(next_p, y), 0).r;
+                next_dy = f32(y - i32(nc));
+                next_f = next_dy * next_dy;
+            }
         }
-        let p = v[k];
-        let cy_p = textureLoad(row_in, vec2<i32>(p, y), 0).r;
-        let dy_p = f32(y - i32(cy_p));
-        let dx = f32(x - p);
-        let dist2 = dx * dx + dy_p * dy_p;
+        let dx = f32(x - cur_p);
+        let dist2 = dx * dx + cur_dy * cur_dy;
         textureStore(sdf_out, vec2<i32>(x, y), vec4<f32>(sqrt(dist2) / diag, 0.0, 0.0, 0.0));
     }
 }

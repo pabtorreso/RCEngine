@@ -109,6 +109,11 @@ fn column_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(0) var row_in: texture_2d<u32>;
 @group(0) @binding(1) var sdf_out: texture_storage_2d<r32float, write>;
 
+// To keep us under the HLSL/D3D12 per-thread temp-register limit (4096
+// regs ≈ 16KB private), the breakpoint array z[] is dropped and the
+// intersections are recomputed lazily from the v[] sites. That trades
+// ~3x more texture reads against ~50% less private memory, which on
+// D3D12 is the binding constraint.
 @compute @workgroup_size(1, 64, 1)
 fn row_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = textureDimensions(row_in);
@@ -116,75 +121,79 @@ fn row_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (y >= i32(dims.y)) { return; }
     let W = i32(dims.x);
 
-    // Envelope state. Each ~8KB private; total 16KB this shader.
-    var v: array<i32, MAX_DIM>;   // envelope site indices
-    var z: array<f32, MAX_DIM>;   // intersections; z[k+1] is the right edge of slot k
+    var v: array<i32, MAX_DIM>;   // envelope site indices (column x of each parabola)
+    var num: i32 = 0;             // number of sites currently on the envelope
 
     let diag = sqrt(f32(dims.x * dims.x + dims.y * dims.y));
 
-    // Locate the first column that actually has a column-nearest seed.
-    var first: i32 = -1;
-    for (var x: i32 = 0; x < W; x = x + 1) {
-        if (textureLoad(row_in, vec2<i32>(x, y), 0).r != SENTINEL) {
-            first = x;
-            break;
+    // Build envelope. For each candidate column q, drop trailing sites
+    // whose dominance interval would be fully covered by q's parabola.
+    for (var q: i32 = 0; q < W; q = q + 1) {
+        let cy_q = textureLoad(row_in, vec2<i32>(q, y), 0).r;
+        if (cy_q == SENTINEL) { continue; }
+        let dy_q = f32(y - i32(cy_q));
+        let f_q = dy_q * dy_q;
+
+        loop {
+            if (num == 0) { break; }
+            let p = v[num - 1];
+            let cy_p = textureLoad(row_in, vec2<i32>(p, y), 0).r;
+            let dy_p = f32(y - i32(cy_p));
+            let f_p = dy_p * dy_p;
+
+            // Intersection between parabolas at p and q.
+            let s_pq = ((f_q + f32(q) * f32(q)) - (f_p + f32(p) * f32(p))) /
+                       (2.0 * f32(q - p));
+
+            // Previous-site breakpoint (z[num-1]) is -inf when there is
+            // no v[num-2]; otherwise recompute it on the fly.
+            var prev_z: f32 = -INF;
+            if (num >= 2) {
+                let pp = v[num - 2];
+                let cy_pp = textureLoad(row_in, vec2<i32>(pp, y), 0).r;
+                let dy_pp = f32(y - i32(cy_pp));
+                let f_pp = dy_pp * dy_pp;
+                prev_z = ((f_p + f32(p) * f32(p)) - (f_pp + f32(pp) * f32(pp))) /
+                         (2.0 * f32(p - pp));
+            }
+
+            if (s_pq > prev_z) { break; }  // q's intersection lies to the right → keep p
+            num = num - 1;                  // q dominates p; pop
+        }
+        if (num < MAX_DIM_I) {
+            v[num] = q;
+            num = num + 1;
         }
     }
-    if (first < 0) {
-        // No seed anywhere in any column at this row — write max distance.
+
+    if (num == 0) {
+        // No seed in any column at this row → max distance everywhere.
         for (var x: i32 = 0; x < W; x = x + 1) {
             textureStore(sdf_out, vec2<i32>(x, y), vec4<f32>(1.0, 0.0, 0.0, 0.0));
         }
         return;
     }
 
+    // Read off the envelope. Slide a pointer k across the sorted sites,
+    // recomputing the breakpoint between v[k] and v[k+1] on the fly.
     var k: i32 = 0;
-    v[0] = first;
-    z[0] = -INF;
-    z[1] = INF;
-
-    // Build envelope.
-    for (var q: i32 = first + 1; q < W; q = q + 1) {
-        let cy_q = textureLoad(row_in, vec2<i32>(q, y), 0).r;
-        if (cy_q == SENTINEL) { continue; }
-        let dy_q = f32(y - i32(cy_q));
-        let f_q = dy_q * dy_q;
-
-        // Pop sites whose dominance region is fully covered by q.
-        loop {
-            let p = v[k];
-            let cy_p = textureLoad(row_in, vec2<i32>(p, y), 0).r;
-            let dy_p = f32(y - i32(cy_p));
-            let f_p = dy_p * dy_p;
-
-            let s = ((f_q + f32(q) * f32(q)) - (f_p + f32(p) * f32(p))) /
-                    (2.0 * f32(q - p));
-
-            if (s > z[k]) {
-                k = k + 1;
-                v[k] = q;
-                z[k] = s;
-                z[k + 1] = INF;
-                break;
-            }
-            if (k == 0) {
-                v[0] = q;
-                z[0] = -INF;
-                break;
-            }
-            k = k - 1;
-        }
-    }
-
-    // Read off — single pass through x, advancing the envelope pointer.
-    var kk: i32 = 0;
     for (var x: i32 = 0; x < W; x = x + 1) {
         loop {
-            if (kk >= MAX_DIM_I - 1) { break; }
-            if (z[kk + 1] >= f32(x)) { break; }
-            kk = kk + 1;
+            if (k + 1 >= num) { break; }
+            let p = v[k];
+            let q = v[k + 1];
+            let cy_p = textureLoad(row_in, vec2<i32>(p, y), 0).r;
+            let cy_q = textureLoad(row_in, vec2<i32>(q, y), 0).r;
+            let dy_p = f32(y - i32(cy_p));
+            let dy_q = f32(y - i32(cy_q));
+            let f_p = dy_p * dy_p;
+            let f_q = dy_q * dy_q;
+            let z = ((f_q + f32(q) * f32(q)) - (f_p + f32(p) * f32(p))) /
+                    (2.0 * f32(q - p));
+            if (f32(x) < z) { break; }
+            k = k + 1;
         }
-        let p = v[kk];
+        let p = v[k];
         let cy_p = textureLoad(row_in, vec2<i32>(p, y), 0).r;
         let dy_p = f32(y - i32(cy_p));
         let dx = f32(x - p);

@@ -31,6 +31,13 @@ pub const SdfGenerator = struct {
     col_texture: zgpu.TextureHandle,
     col_view: zgpu.TextureViewHandle,
 
+    // Storage-buffer scratch shared between column_main (forward sweep
+    // stash, indexed x*H + y) and row_main (envelope sites, indexed
+    // y*W + k). Reuse is safe because the two passes are serialised.
+    // Size = W * H * sizeof(i32). Removes the previous MAX_DIM=2048 cap.
+    scratch_buffer: zgpu.BufferHandle,
+    scratch_size: u32,
+
     init_pipeline: zgpu.ComputePipelineHandle,
     column_pipeline: zgpu.ComputePipelineHandle,
     row_pipeline: zgpu.ComputePipelineHandle,
@@ -68,6 +75,12 @@ pub const SdfGenerator = struct {
         });
         const sdf_view = gctx.createTextureView(sdf_texture, .{});
 
+        const scratch_size: u32 = width * height * @sizeOf(i32);
+        const scratch_buffer = gctx.createBuffer(.{
+            .usage = .{ .storage = true },
+            .size = scratch_size,
+        });
+
         const init_bgl = gctx.createBindGroupLayout(&.{
             zgpu.textureEntry(0, .{ .compute = true }, .depth, .tvdim_2d, false),
             zgpu.storageTextureEntry(1, .{ .compute = true }, .write_only, .r32_uint, .tvdim_2d),
@@ -75,10 +88,12 @@ pub const SdfGenerator = struct {
         const column_bgl = gctx.createBindGroupLayout(&.{
             zgpu.textureEntry(0, .{ .compute = true }, .uint, .tvdim_2d, false),
             zgpu.storageTextureEntry(1, .{ .compute = true }, .write_only, .r32_uint, .tvdim_2d),
+            zgpu.bufferEntry(2, .{ .compute = true }, .storage, false, 0),
         });
         const row_bgl = gctx.createBindGroupLayout(&.{
             zgpu.textureEntry(0, .{ .compute = true }, .uint, .tvdim_2d, false),
             zgpu.storageTextureEntry(1, .{ .compute = true }, .write_only, .r32_float, .tvdim_2d),
+            zgpu.bufferEntry(2, .{ .compute = true }, .storage, false, 0),
         });
 
         const init_pipeline = createComputePipeline(gctx, init_bgl, pba_wgsl, "init_main", "pba_init");
@@ -95,6 +110,8 @@ pub const SdfGenerator = struct {
             .col_view = col_view,
             .sdf_texture = sdf_texture,
             .sdf_view = sdf_view,
+            .scratch_buffer = scratch_buffer,
+            .scratch_size = scratch_size,
             .init_pipeline = init_pipeline,
             .column_pipeline = column_pipeline,
             .row_pipeline = row_pipeline,
@@ -111,6 +128,7 @@ pub const SdfGenerator = struct {
         gctx.releaseResource(self.row_pipeline);
         gctx.releaseResource(self.column_pipeline);
         gctx.releaseResource(self.init_pipeline);
+        gctx.releaseResource(self.scratch_buffer);
         gctx.releaseResource(self.sdf_view);
         gctx.destroyResource(self.sdf_texture);
         gctx.releaseResource(self.col_view);
@@ -146,6 +164,7 @@ pub const SdfGenerator = struct {
             const bg = gctx.createBindGroup(self.column_bgl, &.{
                 .{ .binding = 0, .texture_view_handle = self.seed_view },
                 .{ .binding = 1, .texture_view_handle = self.col_view },
+                .{ .binding = 2, .buffer_handle = self.scratch_buffer, .offset = 0, .size = self.scratch_size },
             });
 
             pass.setPipeline(gctx.lookupResource(self.column_pipeline).?);
@@ -163,6 +182,7 @@ pub const SdfGenerator = struct {
             const bg = gctx.createBindGroup(self.row_bgl, &.{
                 .{ .binding = 0, .texture_view_handle = self.col_view },
                 .{ .binding = 1, .texture_view_handle = self.sdf_view },
+                .{ .binding = 2, .buffer_handle = self.scratch_buffer, .offset = 0, .size = self.scratch_size },
             });
 
             pass.setPipeline(gctx.lookupResource(self.row_pipeline).?);

@@ -1,29 +1,28 @@
 // pba.wgsl — Parallel-Banding-style exact 2D distance transform.
 //
-// Replaces the JFA cascade (1 init + log2(N) step passes + 1 distance =
-// 13 dispatches at 1080p) with three passes that together do O(W*H) work
-// and produce an EXACT Euclidean distance transform. The math follows
-// Cao/Tang/Tan "PBA" (2010) for the high-level structure and uses
-// Felzenszwalb & Huttenlocher's 1D parabolic envelope (2012) for the
-// final row sweep. The implementation is a simplified WGSL port:
+// Three compute passes that together do O(W*H) work and produce an
+// EXACT Euclidean distance transform. Math follows Cao/Tang/Tan "PBA"
+// (2010) for the separable structure and Felzenszwalb & Huttenlocher
+// (2012) for the 1D parabolic lower-envelope.
 //
-//   init_main   — marks seed pixels (value = y for occupied, SENTINEL otherwise).
-//   column_main — per column, two sequential sweeps (top-down, bottom-up)
-//                 settle the nearest seed Y for every pixel in that column.
-//   row_main    — per row, runs the 1D lower envelope using col_y as the
-//                 sampled function f(x) = (y - col_y[x])². The envelope's
-//                 closest site gives the EXACT 2D Euclidean distance.
+//   init_main   — depth → r32uint seed marker (y if occupied, SENTINEL otherwise).
+//   column_main — per column, forward+backward sweep settles nearest seed Y.
+//   row_main    — per row, 1D lower envelope over column results → final SDF.
 //
-// MAX_DIM bounds the private arrays; this implementation supports SDFs
-// up to 2048x2048 (covers 1080p and 1440p ultra). Larger needs tiling.
+// Both column_main and row_main need O(H) and O(W) scratch respectively
+// per thread; that overflows the HLSL/D3D12 per-thread temp-register
+// limit (4096 regs ≈ 16KB) at any resolution above ~1080p. To remove
+// the cap we keep the scratch in a single shared storage buffer — both
+// passes alias the same allocation (they run sequentially, so the
+// reuse is safe). Allocation size is W*H i32 entries, ~8MB at 1080p
+// and ~33MB at 4K. The buffer also drops the MAX_DIM=2048 limit that
+// the previous private-array implementation had.
 
-const SENTINEL: u32 = 0xFFFFFFFFu;
-const MAX_DIM: u32 = 2048u;
-const MAX_DIM_I: i32 = 2048;
-const INF: f32 = 1e20;
+const SENTINEL_U: u32 = 0xFFFFFFFFu;
+const SENTINEL_I: i32 = -1;
 
 // =====================================================================
-// init_main — depth → r32uint seed marker (y if occupied, SENTINEL if not)
+// init_main — depth → r32uint seed marker
 // =====================================================================
 @group(0) @binding(0) var depth_tex: texture_depth_2d;
 @group(0) @binding(1) var seed_out: texture_storage_2d<r32uint, write>;
@@ -39,7 +38,7 @@ fn init_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let d_coord = vec2<i32>((vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) * scale);
     let depth = textureLoad(depth_tex, d_coord, 0);
 
-    var value: u32 = SENTINEL;
+    var value: u32 = SENTINEL_U;
     if (depth < 1.0) { value = gid.y; }
     textureStore(seed_out, vec2<i32>(vec2<u32>(gid.x, gid.y)), vec4<u32>(value, 0u, 0u, 0u));
 }
@@ -47,13 +46,14 @@ fn init_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // =====================================================================
 // column_main — per column, find nearest seed Y for each pixel.
 //
-// One thread = one column. Two sweeps (top-down then bottom-up) settle
-// the candidate from each direction; we keep the closer one. The
-// top-down result is stashed in a private array so we don't need a
-// separate intermediate texture.
+// Two sequential sweeps (top-down, bottom-up) per column; we keep the
+// closer candidate. Forward sweep stashes its result into the shared
+// scratch storage buffer at offset (x * H + y), then the backward
+// sweep reads it back and combines.
 // =====================================================================
 @group(0) @binding(0) var col_in: texture_2d<u32>;
 @group(0) @binding(1) var col_out: texture_storage_2d<r32uint, write>;
+@group(0) @binding(2) var<storage, read_write> scratch: array<i32>;
 
 @compute @workgroup_size(64, 1, 1)
 fn column_main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -61,32 +61,30 @@ fn column_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let x = i32(gid.x);
     if (x >= i32(dims.x)) { return; }
     let H = i32(dims.y);
+    let base = x * H;
 
-    // Forward sweep stashed here. ~8KB private per thread.
-    var fwd: array<u32, MAX_DIM>;
-
-    var last: u32 = SENTINEL;
+    var last: i32 = SENTINEL_I;
     for (var y: i32 = 0; y < H; y = y + 1) {
         let v = textureLoad(col_in, vec2<i32>(x, y), 0).r;
-        if (v != SENTINEL) { last = u32(y); }
-        fwd[y] = last;
+        if (v != SENTINEL_U) { last = y; }
+        scratch[base + y] = last;
     }
 
-    last = SENTINEL;
+    last = SENTINEL_I;
     for (var y: i32 = H - 1; y >= 0; y = y - 1) {
         let v = textureLoad(col_in, vec2<i32>(x, y), 0).r;
-        if (v != SENTINEL) { last = u32(y); }
+        if (v != SENTINEL_U) { last = y; }
 
-        let f = fwd[y];
-        var nearest: u32 = SENTINEL;
-        if (f != SENTINEL && last != SENTINEL) {
-            let d_f = abs(y - i32(f));
-            let d_b = abs(i32(last) - y);
-            if (d_f <= d_b) { nearest = f; } else { nearest = last; }
-        } else if (f != SENTINEL) {
-            nearest = f;
-        } else if (last != SENTINEL) {
-            nearest = last;
+        let f = scratch[base + y];
+        var nearest: u32 = SENTINEL_U;
+        if (f != SENTINEL_I && last != SENTINEL_I) {
+            let d_f = abs(y - f);
+            let d_b = abs(last - y);
+            if (d_f <= d_b) { nearest = u32(f); } else { nearest = u32(last); }
+        } else if (f != SENTINEL_I) {
+            nearest = u32(f);
+        } else if (last != SENTINEL_I) {
+            nearest = u32(last);
         }
         textureStore(col_out, vec2<i32>(x, y), vec4<u32>(nearest, 0u, 0u, 0u));
     }
@@ -95,48 +93,37 @@ fn column_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // =====================================================================
 // row_main — per row, 1D lower-envelope DT over columns.
 //
-// One thread = one row. f(x) = (y - col_y[x, y])² if col_y is valid,
-// else +inf. Builds the parabolic lower envelope (sites v[], breakpoints
-// z[]) in two phases:
-//   1. Forward sweep building the envelope stack.
-//   2. Linear scan reading the envelope back into the SDF, advancing
-//      the pointer through z[] as x grows.
-//
-// Result is the EXACT 2D Euclidean distance — no JFA approximation. The
-// output is normalised by the screen diagonal so the consumer keeps the
-// same units it had with JFA.
+// f(x) = (y - col_y[x, y])² if col_y is valid, else +inf. Builds the
+// parabolic lower envelope (sites v[k] = x indices) and reads it off
+// to produce the exact 2D Euclidean distance. The envelope's z[]
+// breakpoints are NOT stored; we recompute them on the fly from v[]
+// to halve scratch usage.
 // =====================================================================
 @group(0) @binding(0) var row_in: texture_2d<u32>;
 @group(0) @binding(1) var sdf_out: texture_storage_2d<r32float, write>;
+@group(0) @binding(2) var<storage, read_write> row_scratch: array<i32>;
 
-// To keep us under the HLSL/D3D12 per-thread temp-register limit (4096
-// regs ≈ 16KB private), the breakpoint array z[] is dropped and the
-// intersections are recomputed lazily from the v[] sites. That trades
-// ~3x more texture reads against ~50% less private memory, which on
-// D3D12 is the binding constraint.
 @compute @workgroup_size(1, 64, 1)
 fn row_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = textureDimensions(row_in);
     let y = i32(gid.y);
     if (y >= i32(dims.y)) { return; }
     let W = i32(dims.x);
+    let base = y * W;
 
-    var v: array<i32, MAX_DIM>;   // envelope site indices (column x of each parabola)
-    var num: i32 = 0;             // number of sites currently on the envelope
-
+    var num: i32 = 0;
     let diag = sqrt(f32(dims.x * dims.x + dims.y * dims.y));
 
-    // Build envelope. For each candidate column q, drop trailing sites
-    // whose dominance interval would be fully covered by q's parabola.
+    // Build envelope.
     for (var q: i32 = 0; q < W; q = q + 1) {
         let cy_q = textureLoad(row_in, vec2<i32>(q, y), 0).r;
-        if (cy_q == SENTINEL) { continue; }
+        if (cy_q == SENTINEL_U) { continue; }
         let dy_q = f32(y - i32(cy_q));
         let f_q = dy_q * dy_q;
 
         loop {
             if (num == 0) { break; }
-            let p = v[num - 1];
+            let p = row_scratch[base + num - 1];
             let cy_p = textureLoad(row_in, vec2<i32>(p, y), 0).r;
             let dy_p = f32(y - i32(cy_p));
             let f_p = dy_p * dy_p;
@@ -145,11 +132,11 @@ fn row_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let s_pq = ((f_q + f32(q) * f32(q)) - (f_p + f32(p) * f32(p))) /
                        (2.0 * f32(q - p));
 
-            // Previous-site breakpoint (z[num-1]) is -inf when there is
-            // no v[num-2]; otherwise recompute it on the fly.
-            var prev_z: f32 = -INF;
+            // Previous-site breakpoint (recomputed). Sentinel = -inf
+            // when there's no v[num-2].
+            var prev_z: f32 = -1e20;
             if (num >= 2) {
-                let pp = v[num - 2];
+                let pp = row_scratch[base + num - 2];
                 let cy_pp = textureLoad(row_in, vec2<i32>(pp, y), 0).r;
                 let dy_pp = f32(y - i32(cy_pp));
                 let f_pp = dy_pp * dy_pp;
@@ -157,31 +144,27 @@ fn row_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                          (2.0 * f32(p - pp));
             }
 
-            if (s_pq > prev_z) { break; }  // q's intersection lies to the right → keep p
-            num = num - 1;                  // q dominates p; pop
+            if (s_pq > prev_z) { break; }
+            num = num - 1;
         }
-        if (num < MAX_DIM_I) {
-            v[num] = q;
-            num = num + 1;
-        }
+        row_scratch[base + num] = q;
+        num = num + 1;
     }
 
     if (num == 0) {
-        // No seed in any column at this row → max distance everywhere.
         for (var x: i32 = 0; x < W; x = x + 1) {
             textureStore(sdf_out, vec2<i32>(x, y), vec4<f32>(1.0, 0.0, 0.0, 0.0));
         }
         return;
     }
 
-    // Read off the envelope. Slide a pointer k across the sorted sites,
-    // recomputing the breakpoint between v[k] and v[k+1] on the fly.
+    // Read off.
     var k: i32 = 0;
     for (var x: i32 = 0; x < W; x = x + 1) {
         loop {
             if (k + 1 >= num) { break; }
-            let p = v[k];
-            let q = v[k + 1];
+            let p = row_scratch[base + k];
+            let q = row_scratch[base + k + 1];
             let cy_p = textureLoad(row_in, vec2<i32>(p, y), 0).r;
             let cy_q = textureLoad(row_in, vec2<i32>(q, y), 0).r;
             let dy_p = f32(y - i32(cy_p));
@@ -193,7 +176,7 @@ fn row_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             if (f32(x) < z) { break; }
             k = k + 1;
         }
-        let p = v[k];
+        let p = row_scratch[base + k];
         let cy_p = textureLoad(row_in, vec2<i32>(p, y), 0).r;
         let dy_p = f32(y - i32(cy_p));
         let dx = f32(x - p);

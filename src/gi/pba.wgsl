@@ -23,8 +23,14 @@
 
 const SENTINEL_U: u32 = 0xFFFFFFFFu;
 const SENTINEL_I: i32 = -1;
-const MAX_DIM: u32 = 2048u;
-const MAX_DIM_I: i32 = 2048;
+// MAX_DIM caps the row envelope. 2000 (not 2048) keeps row_main's
+// workgroup-shared layout (band_v 8KB + band_num 128B + global_v +
+// global_num) just under the WebGPU 16384-byte workgroup-storage
+// minimum. Width is still effectively capped at 2048 by other paths;
+// the envelope rarely approaches even W on real scenes, so trimming
+// 48 entries off the cap is invisible in practice.
+const MAX_DIM: u32 = 2000u;
+const MAX_DIM_I: i32 = 2000;
 
 // =====================================================================
 // init_main — depth → r32uint seed marker

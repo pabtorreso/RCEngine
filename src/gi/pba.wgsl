@@ -275,3 +275,133 @@ fn row_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(sdf_out, vec2<i32>(x, y), vec4<f32>(sqrt(dist2) / diag, 0.0, 0.0, 0.0));
     }
 }
+
+// =====================================================================
+// row_main_buf — same algorithm as row_main, but the envelope sites
+// array lives in a STORAGE BUFFER (one row's slice = W i32 entries at
+// offset y*W) instead of a private array. Used when width > MAX_DIM so
+// the private array would either overflow the cap or push past D3D12's
+// 4096-temp-reg limit. ~10x slower per scratch access vs registers, but
+// the only available path for 1440p widescreen / 4K Ultra / etc.
+// SdfGenerator picks this pipeline automatically at init time.
+// =====================================================================
+@group(0) @binding(2) var<storage, read_write> row_scratch: array<i32>;
+
+@compute @workgroup_size(1, 64, 1)
+fn row_main_buf(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(row_in);
+    let y = i32(gid.y);
+    if (y >= i32(dims.y)) { return; }
+    let W = i32(dims.x);
+    let base = y * W;
+
+    var num: i32 = 0;
+    let diag = sqrt(f32(dims.x * dims.x + dims.y * dims.y));
+
+    var top_p: i32 = 0;
+    var top_dy: f32 = 0.0;
+    var top_f: f32 = 0.0;
+    var top_p_sq: f32 = 0.0;
+
+    var sec_p: i32 = 0;
+    var sec_dy: f32 = 0.0;
+    var sec_f: f32 = 0.0;
+    var sec_p_sq: f32 = 0.0;
+
+    for (var q: i32 = 0; q < W; q = q + 1) {
+        let cy_q = textureLoad(row_in, vec2<i32>(q, y), 0).r;
+        if (cy_q == SENTINEL_U) { continue; }
+        let dy_q = f32(y - i32(cy_q));
+        let f_q = dy_q * dy_q;
+        let q_sq = f32(q) * f32(q);
+
+        loop {
+            if (num == 0) { break; }
+            let s_pq = ((f_q + q_sq) - (top_f + top_p_sq)) /
+                       (2.0 * f32(q - top_p));
+            var prev_z: f32 = -1e20;
+            if (num >= 2) {
+                prev_z = ((top_f + top_p_sq) - (sec_f + sec_p_sq)) /
+                         (2.0 * f32(top_p - sec_p));
+            }
+            if (s_pq > prev_z) { break; }
+
+            num = num - 1;
+            if (num >= 1) {
+                top_p = sec_p;
+                top_dy = sec_dy;
+                top_f = sec_f;
+                top_p_sq = sec_p_sq;
+                if (num >= 2) {
+                    sec_p = row_scratch[base + num - 2];
+                    let scy = textureLoad(row_in, vec2<i32>(sec_p, y), 0).r;
+                    sec_dy = f32(y - i32(scy));
+                    sec_f = sec_dy * sec_dy;
+                    sec_p_sq = f32(sec_p) * f32(sec_p);
+                }
+            }
+        }
+        // Buffer is sized W*H, so num is naturally bounded by W per row.
+        if (num < W) {
+            if (num >= 1) {
+                sec_p = top_p;
+                sec_dy = top_dy;
+                sec_f = top_f;
+                sec_p_sq = top_p_sq;
+            }
+            row_scratch[base + num] = q;
+            top_p = q;
+            top_dy = dy_q;
+            top_f = f_q;
+            top_p_sq = q_sq;
+            num = num + 1;
+        }
+    }
+
+    if (num == 0) {
+        for (var x: i32 = 0; x < W; x = x + 1) {
+            textureStore(sdf_out, vec2<i32>(x, y), vec4<f32>(1.0, 0.0, 0.0, 0.0));
+        }
+        return;
+    }
+
+    var k: i32 = 0;
+    var cur_p: i32 = row_scratch[base + 0];
+    let cur_cy_load = textureLoad(row_in, vec2<i32>(cur_p, y), 0).r;
+    var cur_dy: f32 = f32(y - i32(cur_cy_load));
+    var cur_f: f32 = cur_dy * cur_dy;
+
+    var has_next: bool = (num > 1);
+    var next_p: i32 = 0;
+    var next_dy: f32 = 0.0;
+    var next_f: f32 = 0.0;
+    if (has_next) {
+        next_p = row_scratch[base + 1];
+        let nc = textureLoad(row_in, vec2<i32>(next_p, y), 0).r;
+        next_dy = f32(y - i32(nc));
+        next_f = next_dy * next_dy;
+    }
+
+    for (var x: i32 = 0; x < W; x = x + 1) {
+        loop {
+            if (!has_next) { break; }
+            let z = ((next_f + f32(next_p) * f32(next_p)) - (cur_f + f32(cur_p) * f32(cur_p))) /
+                    (2.0 * f32(next_p - cur_p));
+            if (f32(x) < z) { break; }
+            cur_p = next_p;
+            cur_dy = next_dy;
+            cur_f = next_f;
+            k = k + 1;
+            has_next = (k + 1 < num);
+            if (has_next) {
+                next_p = row_scratch[base + k + 1];
+                let nc = textureLoad(row_in, vec2<i32>(next_p, y), 0).r;
+                next_dy = f32(y - i32(nc));
+                next_f = next_dy * next_dy;
+            }
+        }
+        let dx = f32(x - cur_p);
+        let dist2 = dx * dx + cur_dy * cur_dy;
+        textureStore(sdf_out, vec2<i32>(x, y), vec4<f32>(sqrt(dist2) / diag, 0.0, 0.0, 0.0));
+    }
+}

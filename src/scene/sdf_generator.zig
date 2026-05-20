@@ -157,9 +157,9 @@ pub const SdfGenerator = struct {
             gctx.releaseResource(bg);
         }
 
-        // Phase 2: banded row envelope — one workgroup per row, 32 threads
-        // cooperating across horizontal bands (PBA paper-style Phase 3).
+        // Phase 2: row envelope — one thread per row, private v[] up to MAX_DIM.
         {
+            const wg_y = (self.height + 63) / 64;
             const pass = encoder.beginComputePass(null);
             const bg = gctx.createBindGroup(self.row_bgl, &.{
                 .{ .binding = 0, .texture_view_handle = self.col_view },
@@ -168,7 +168,7 @@ pub const SdfGenerator = struct {
 
             pass.setPipeline(gctx.lookupResource(self.row_pipeline).?);
             pass.setBindGroup(0, gctx.lookupResource(bg).?, &.{});
-            pass.dispatchWorkgroups(self.height, 1, 1);
+            pass.dispatchWorkgroups(1, wg_y, 1);
             pass.end();
             pass.release();
             gctx.releaseResource(bg);

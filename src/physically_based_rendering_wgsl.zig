@@ -268,6 +268,8 @@ const mesh_common =
 \\      world_to_clip: mat4x4<f32>,
 \\      camera_position: vec3<f32>,
 \\      draw_mode: i32,
+\\      emissive_color: vec3<f32>,
+\\      _pad: f32,
 \\  }
 \\  @group(0) @binding(0) var<uniform> uniforms: MeshUniforms;
 \\
@@ -341,7 +343,7 @@ pub const mesh_fs = global ++ mesh_common ++
 \\      var output: GBufferOutput;
 \\      output.albedo_roughness = vec4(base_color, roughness);
 \\      output.normal_metal = vec4(n, metallic);
-\\      output.emissive = vec4(0.0, 0.0, 0.0, 1.0);
+\\      output.emissive = vec4(uniforms.emissive_color, 1.0);
 \\      return output;
 \\  }
 ;
@@ -393,8 +395,13 @@ pub const deferred_fs = global ++
 \\      } else if (uniforms.draw_mode == 4) { // Depth
 \\          return vec4(vec3(pow(depth, 100.0)), 1.0); // Visualize depth curve
 \\      } else if (uniforms.draw_mode == 5) { // SDF
-\\          let sdf_val = textureLoad(g_sdf, uv, 0).x;
-\\          return vec4(vec3(sdf_val), 1.0); // Visualize SDF as grayscale
+\\          // The SDF can be coarser than the framebuffer when the user
+\\          // picks a non-Ultra SDF quality — sample with scaled coords.
+\\          let sdf_dim = textureDimensions(g_sdf);
+\\          let fb_dim = textureDimensions(g_depth);
+\\          let sdf_uv = vec2<i32>(vec2<f32>(uv) * vec2<f32>(f32(sdf_dim.x), f32(sdf_dim.y)) / vec2<f32>(f32(fb_dim.x), f32(fb_dim.y)));
+\\          let sdf_val = textureLoad(g_sdf, sdf_uv, 0).x;
+\\          return vec4(vec3(sdf_val), 1.0);
 \\      } else if (uniforms.draw_mode == 6) { // Radiance Cascades GI
 \\          return vec4(gi, 1.0);
 \\      }
